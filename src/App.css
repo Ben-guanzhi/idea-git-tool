@@ -1,0 +1,640 @@
+:root {
+  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.4;
+  font-weight: 400;
+  color: #0f0f0f;
+  background-color: #eceff1;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  height: 100vh;
+  overflow: hidden;
+}
+
+#root {
+  height: 100vh;
+}
+
+button {
+  outline: none;
+}
+
+.muted {
+  color: #999;
+}
+
+/* Layout: topbar on top, main window fills the rest */
+.ide {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+.ide-topbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: #fff;
+  border-bottom: 1px solid #ddd;
+  flex-shrink: 0;
+}
+
+.repo-input {
+  flex: 1;
+  max-width: 400px;
+  padding: 5px 10px;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+}
+
+.branch-select {
+  padding: 5px 8px;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  background: #e8eef7;
+  font-weight: 600;
+  max-width: 220px;
+}
+
+.upstream {
+  font-size: 0.8em;
+  color: #555;
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.btn {
+  border: 1px solid #bbb;
+  background: #fff;
+  border-radius: 6px;
+  padding: 5px 10px;
+  cursor: pointer;
+  font-weight: 500;
+}
+
+.btn:hover {
+  background: #eef2f7;
+  border-color: #1976d2;
+}
+
+.ide-error {
+  background: #fdecea;
+  color: #b71c1c;
+  padding: 6px 12px;
+  border-bottom: 1px solid #f5c6c6;
+  flex-shrink: 0;
+}
+
+.ide-info {
+  background: #e8f5e9;
+  color: #1b5e20;
+  padding: 6px 12px;
+  border-bottom: 1px solid #b2dfdb;
+  flex-shrink: 0;
+}
+
+/* Main tool window */
+.ide-main {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+  border-bottom: 1px solid #ddd;
+}
+
+.ide-tabs {
+  display: flex;
+  border-bottom: 1px solid #ddd;
+  background: #f7f8fa;
+  flex-shrink: 0;
+}
+
+.tab {
+  border: none;
+  background: transparent;
+  padding: 7px 16px;
+  cursor: pointer;
+  font-size: 0.9em;
+  font-weight: 500;
+  color: #555;
+  border-bottom: 2px solid transparent;
+}
+
+.tab.active {
+  color: #0f0f0f;
+  border-bottom-color: #1976d2;
+}
+
+/* Changes pane: tree | diff | commit panel (bottom) */
+.changes-pane {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.changes-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.changes-tree {
+  width: 300px;
+  border-right: 1px solid #ddd;
+  background: #f7f8fa;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+
+.file-group {
+  border-bottom: 1px solid #e0e0e0;
+}
+
+.file-group-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 8px;
+  background: #eceff1;
+  border-bottom: 1px solid #e0e0e0;
+}
+
+.file-group-title {
+  font-weight: 600;
+  font-size: 0.85em;
+}
+
+.file-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.file-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  cursor: pointer;
+  font-size: 0.9em;
+}
+
+.file-item:hover {
+  background: #e3f0fd;
+}
+
+.file-item.selected {
+  background: #cfe3fb;
+}
+
+.file-empty {
+  padding: 6px 8px;
+  color: #999;
+  font-size: 0.85em;
+}
+
+.file-icon {
+  flex-shrink: 0;
+  width: 16px;
+  text-align: center;
+  font-size: 0.8em;
+}
+
+.status-modified { color: #1976d2; }
+.status-added { color: #2e7d32; }
+.status-deleted { color: #c62828; }
+.status-renamed { color: #6a1b9a; }
+.status-conflicted { color: #d32f2f; }
+
+.file-path {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mini-btn {
+  flex-shrink: 0;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-size: 0.8em;
+  color: #555;
+  padding: 0 4px;
+  border-radius: 4px;
+}
+
+.mini-btn:hover {
+  background: #d0d0d0;
+}
+
+/* Diff area */
+.diff-area {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.file-diff,
+.conflict-editor {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.diff-toolbar,
+.conflict-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid #ddd;
+  background: #f7f8fa;
+  flex-shrink: 0;
+}
+
+.diff-title {
+  font-weight: 600;
+  font-size: 0.9em;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diff-lines {
+  flex: 1;
+  overflow: auto;
+  font-family: "SFMono-Regular", Consolas, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.diff-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  white-space: pre;
+}
+
+.diff-cell {
+  padding: 0 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.diff-cell + .diff-cell {
+  border-left: 1px solid #e0e0e0;
+}
+
+.diff-row.diff-added .diff-cell + .diff-cell {
+  background: #e8f5e9;
+}
+
+.diff-row.diff-added .diff-cell:first-child {
+  background: #f0f0f0;
+  color: #999;
+}
+
+.diff-row.diff-removed .diff-cell:first-child {
+  background: #fdecea;
+  color: #b71c1c;
+}
+
+.diff-row.diff-removed .diff-cell + .diff-cell {
+  background: #f7f7f7;
+  color: #999;
+}
+
+.diff-row.diff-modified .diff-cell:first-child {
+  background: #fdecea;
+  color: #b71c1c;
+}
+
+.diff-row.diff-modified .diff-cell + .diff-cell {
+  background: #e8f5e9;
+  color: #1b5e20;
+}
+
+.diff-row .hl {
+  background: #ffb3b3;
+}
+
+.diff-row.diff-modified .diff-cell + .diff-cell .hl {
+  background: #a5d6a7;
+}
+
+.diff-row.diff-modified .diff-cell:first-child .hl {
+  background: #ef9a9a;
+}
+
+.edit-area {
+  flex: 1;
+  border: none;
+  resize: none;
+  padding: 8px;
+  font-family: "SFMono-Regular", Consolas, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre;
+}
+
+.empty-pane {
+  color: #999;
+  text-align: center;
+  padding: 40px;
+}
+
+/* Commit panel (bottom of changes pane) */
+.commit-panel {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+  padding: 8px;
+  border-top: 1px solid #ddd;
+  background: #f7f8fa;
+  flex-shrink: 0;
+}
+
+.commit-msg {
+  flex: 1;
+  min-height: 46px;
+  resize: vertical;
+  padding: 6px;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  font-family: inherit;
+}
+
+.commit-btn {
+  border: none;
+  border-radius: 6px;
+  padding: 8px 18px;
+  cursor: pointer;
+  font-weight: 600;
+  color: #fff;
+  background: #1976d2;
+}
+
+.commit-btn:hover {
+  background: #1565c0;
+}
+
+/* Conflict resolve buttons */
+.btn.ours {
+  background: #2e7d32;
+  color: #fff;
+  border-color: #2e7d32;
+}
+
+.btn.theirs {
+  background: #c62828;
+  color: #fff;
+  border-color: #c62828;
+}
+
+/* Log pane */
+.log-pane {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.log-list {
+  padding: 8px;
+}
+
+.log-item {
+  padding: 6px 8px;
+  border-bottom: 1px solid #eee;
+}
+
+.log-item:hover {
+  background: #f5f7fa;
+}
+
+.log-refs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 2px;
+}
+
+.log-ref {
+  font-size: 0.7em;
+  background: #1976d2;
+  color: #fff;
+  border-radius: 3px;
+  padding: 0 4px;
+}
+
+.log-msg {
+  font-weight: 600;
+  font-size: 0.95em;
+}
+
+.log-meta {
+  font-size: 0.8em;
+  color: #777;
+}
+
+/* Bottom branch actions bar */
+.branch-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 12px;
+  background: #f7f8fa;
+  border-top: 1px solid #ddd;
+  flex-shrink: 0;
+}
+
+.small-input {
+  flex: 0 1 160px;
+  min-width: 0;
+  padding: 5px 8px;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color: #e6e6e6;
+    background-color: #1e1e1e;
+  }
+
+  .ide-topbar,
+  .ide-main,
+  .branch-actions {
+    background: #2b2b2b;
+  }
+
+  .ide-topbar,
+  .ide-main {
+    border-bottom-color: #444;
+  }
+
+  .repo-input,
+  .small-input,
+  .commit-msg {
+    background: #1e1e1e;
+    color: #e6e6e6;
+    border-color: #555;
+  }
+
+  .branch-select {
+    background: #1f3a5f;
+    color: #d6e6f8;
+    border-color: #1f3a5f;
+  }
+
+  .upstream {
+    color: #9db8d6;
+  }
+
+  .btn {
+    background: #3a3a3a;
+    border-color: #555;
+    color: #e6e6e6;
+  }
+
+  .btn:hover {
+    background: #4a4a4a;
+  }
+
+  .ide-tabs {
+    background: #252526;
+    border-bottom-color: #444;
+  }
+
+  .tab {
+    color: #aaa;
+  }
+
+  .tab.active {
+    color: #e6e6e6;
+    border-bottom-color: #4d9de0;
+  }
+
+  .changes-tree {
+    background: #252526;
+    border-color: #444;
+  }
+
+  .file-group-header {
+    background: #303030;
+    border-color: #444;
+  }
+
+  .file-item:hover {
+    background: #1f3a5f;
+  }
+
+  .file-item.selected {
+    background: #274b74;
+  }
+
+  .file-empty {
+    color: #777;
+  }
+
+  .file-diff,
+  .conflict-editor {
+    background: #1e1e1e;
+  }
+
+  .diff-toolbar,
+  .conflict-toolbar {
+    background: #252526;
+    border-color: #444;
+  }
+
+  .diff-cell + .diff-cell {
+    border-left-color: #444;
+  }
+
+  .diff-row.diff-added .diff-cell + .diff-cell {
+    background: #1b4d2a;
+  }
+
+  .diff-row.diff-added .diff-cell:first-child {
+    background: #333;
+    color: #888;
+  }
+
+  .diff-row.diff-removed .diff-cell:first-child {
+    background: #5c2424;
+    color: #f3a6a6;
+  }
+
+  .diff-row.diff-removed .diff-cell + .diff-cell {
+    background: #2a2a2a;
+    color: #888;
+  }
+
+  .diff-row.diff-modified .diff-cell:first-child {
+    background: #5c2424;
+    color: #f3a6a6;
+  }
+
+  .diff-row.diff-modified .diff-cell + .diff-cell {
+    background: #1b4d2a;
+    color: #9be3a6;
+  }
+
+  .diff-row .hl {
+    background: #7f1d1d;
+  }
+
+  .diff-row.diff-modified .diff-cell + .diff-cell .hl {
+    background: #1f6b2f;
+  }
+
+  .diff-row.diff-modified .diff-cell:first-child .hl {
+    background: #8c2c2c;
+  }
+
+  .edit-area {
+    background: #1e1e1e;
+    color: #e6e6e6;
+  }
+
+  .commit-panel {
+    background: #252526;
+    border-color: #444;
+  }
+
+  .log-item {
+    border-color: #333;
+  }
+
+  .log-item:hover {
+    background: #252526;
+  }
+
+  .log-meta {
+    color: #999;
+  }
+
+  .mini-btn {
+    color: #aaa;
+  }
+
+  .mini-btn:hover {
+    background: #444;
+  }
+}
