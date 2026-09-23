@@ -156,8 +156,64 @@ fn get_status(repo_path: String) -> Result<StatusInfo, String> {
 fn stage(repo_path: String, paths: Vec<String>) -> Result<(), String> {
     let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
     let mut index = repo.index().map_err(|e| e.to_string())?;
+    let workdir = repo.workdir().map(|w| w.to_path_buf());
     for p in &paths {
-        index.add_path(Path::new(p)).map_err(|e| e.to_string())?;
+        let abs = workdir.as_ref().map(|w| w.join(p));
+        let exists = abs.as_ref().map(|a| a.exists()).unwrap_or(false);
+        if exists {
+            index.add_path(Path::new(p)).map_err(|e| e.to_string())?;
+        } else if index.get_path(Path::new(p), 0).is_some() {
+            // Staging a deletion.
+            index.remove_path(Path::new(p)).map_err(|e| e.to_string())?;
+        }
+    }
+    index.write().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Discard working-tree / index changes for paths: restore from HEAD, or delete untracked.
+#[tauri::command]
+fn discard(repo_path: String, paths: Vec<String>) -> Result<(), String> {
+    let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
+    let head_tree = repo
+        .head()
+        .ok()
+        .and_then(|h| h.peel_to_commit().ok())
+        .and_then(|c| c.tree().ok());
+    let workdir = repo.workdir().map(|w| w.to_path_buf());
+    let mut index = repo.index().map_err(|e| e.to_string())?;
+
+    for p in &paths {
+        let abs = workdir.as_ref().map(|w| w.join(p));
+        let in_index = index.get_path(Path::new(p), 0).is_some();
+        let in_head = head_tree
+            .as_ref()
+            .and_then(|t| t.get_path(Path::new(p)).ok());
+
+        match in_head {
+            Some(entry) => {
+                let blob = repo.find_blob(entry.id()).map_err(|e| e.to_string())?;
+                if let Some(abs) = &abs {
+                    if let Some(parent) = abs.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    std::fs::write(abs, blob.content()).map_err(|e| e.to_string())?;
+                }
+                // Always re-add: covers staged deletions (path missing from index).
+                index.add_path(Path::new(p)).map_err(|e| e.to_string())?;
+            }
+            None => {
+                // Not in HEAD (new file) or untracked: drop from index and disk.
+                if in_index {
+                    index.remove_path(Path::new(p)).map_err(|e| e.to_string())?;
+                }
+                if let Some(abs) = &abs {
+                    if abs.exists() {
+                        std::fs::remove_file(abs).map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+        }
     }
     index.write().map_err(|e| e.to_string())?;
     Ok(())
@@ -260,60 +316,189 @@ fn commit(args: CommitArgs) -> Result<String, String> {
     Ok(commit_id.to_string())
 }
 
-#[tauri::command]
-fn push(repo_path: String, remote: Option<String>, branch: Option<String>) -> Result<String, String> {
-    let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
-    let remote_name = remote
-        .filter(|r| !r.trim().is_empty())
-        .unwrap_or_else(|| "origin".to_string());
-    let mut remote = repo.find_remote(&remote_name).map_err(|e| e.to_string())?;
-    let branch_name = match branch.filter(|b| !b.trim().is_empty()) {
-        Some(b) => b,
-        None => repo_head_name(&repo)?,
-    };
-    let refspec = format!("refs/heads/{branch_name}:refs/heads/{branch_name}");
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MergeResult {
+    /// One of: merged, fastForward, upToDate, conflicts.
+    status: String,
+    message: String,
+    /// Paths with conflicts when status == "conflicts".
+    conflicts: Vec<String>,
+}
 
-    let mut callbacks = git2::RemoteCallbacks::new();
-    callbacks.credentials(|_url, username_from_url, _allowed_types| {
-        let user = username_from_url.unwrap_or("git");
-        ssh_key_cred(user)
-    });
-    let mut push_options = git2::PushOptions::new();
-    push_options.remote_callbacks(callbacks);
-    remote.push(&[&refspec], Some(&mut push_options)).map_err(|e| e.to_string())?;
-    Ok(format!("pushed {branch_name} to {remote_name}"))
+fn current_branch_name(repo: &git2::Repository) -> Result<String, String> {
+    match repo.head() {
+        Ok(h) if h.is_branch() => Ok(h.shorthand().unwrap_or_default().to_string()),
+        Ok(_) => Err("HEAD is detached; cannot merge".to_string()),
+        Err(_) => Err("no commits yet (unborn branch); cannot merge".to_string()),
+    }
+}
+
+fn index_conflict_paths(repo: &git2::Repository) -> Vec<String> {
+    let index = match repo.index() {
+        Ok(i) => i,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    if let Ok(iter) = index.conflicts() {
+        for c in iter.flatten() {
+            if let Some(e) = c.our.as_ref().or(c.their.as_ref()).or(c.ancestor.as_ref()) {
+                let p = String::from_utf8_lossy(&e.path).into_owned();
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
 }
 
 #[tauri::command]
-fn merge(repo_path: String, branch: String) -> Result<String, String> {
+fn merge(repo_path: String, branch: String) -> Result<MergeResult, String> {
     let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
-    let annotated = repo
+    let current = current_branch_name(&repo)?;
+
+    if branch == current {
+        return Err(format!("「{branch}」已经是当前分支，无需合并"));
+    }
+
+    let oid = repo
         .find_branch(&branch, git2::BranchType::Local)
         .or_else(|_| repo.find_branch(&branch, git2::BranchType::Remote))
         .and_then(|b| b.get().peel_to_commit().map(|c| c.id()))
-        .and_then(|oid| repo.find_annotated_commit(oid))
-        .or_else(|_| {
-            let oid = repo.refname_to_id(&branch)?;
-            repo.find_annotated_commit(oid)
-        })
-        .map_err(|e| e.to_string())?;
+        .or_else(|_| repo.refname_to_id(&format!("refs/heads/{branch}")))
+        .or_else(|_| repo.refname_to_id(&format!("refs/remotes/origin/{branch}")))
+        .map_err(|e| format!("找不到分支「{branch}」: {e}"))?;
+    let annotated = repo.find_annotated_commit(oid).map_err(|e| e.to_string())?;
 
-    repo.merge(&[&annotated], None, None).map_err(|e| e.to_string())?;
+    let analysis = repo.merge_analysis(&[&annotated]).map_err(|e| e.to_string())?;
+    let a = analysis.0;
 
-    if repo.index().map_err(|e| e.to_string())?.has_conflicts() {
-        return Ok("merge failed, conflicts present".to_string());
+    if a.is_up_to_date() {
+        return Ok(MergeResult {
+            status: "upToDate".into(),
+            message: format!("「{branch}」已是最新，无需合并"),
+            conflicts: vec![],
+        });
     }
 
-    let head_commit = repo.head().and_then(|h| h.peel_to_commit()).map_err(|e| e.to_string())?;
-    let merge_commit = repo.find_commit(annotated.id()).map_err(|e| e.to_string())?;
-    let sig = repo.signature().map_err(|e| e.to_string())?;
-    let tree = repo.index().map_err(|e| e.to_string())?.write_tree().map_err(|e| e.to_string())?;
-    let tree = repo.find_tree(tree).map_err(|e| e.to_string())?;
+    if a.is_unborn() {
+        // Current branch has no commits: fast-forward HEAD to the target.
+        let refname = format!("refs/heads/{current}");
+        repo.reference(&refname, oid, true, "merge: Fast-Forward")
+            .map_err(|e| e.to_string())?;
+        repo.set_head(&refname).map_err(|e| e.to_string())?;
+        let commit = repo.find_commit(oid).map_err(|e| e.to_string())?;
+        repo.checkout_tree(
+            commit.as_object(),
+            Some(git2::build::CheckoutBuilder::new().force()),
+        )
+        .map_err(|e| e.to_string())?;
+        return Ok(MergeResult {
+            status: "fastForward".into(),
+            message: format!("已将「{branch}」合并到「{current}」"),
+            conflicts: vec![],
+        });
+    }
 
-    repo.commit(Some("HEAD"), &sig, &sig, "Merge branch", &tree, &[&head_commit, &merge_commit])
+    if !a.is_fast_forward() && !a.is_normal() {
+        return Err(format!("不支持的合并类型，无法合并「{branch}」"));
+    }
+
+    if a.is_fast_forward() {
+        // Just move the branch pointer; no merge commit needed.
+        let refname = format!("refs/heads/{current}");
+        repo.reference(&refname, oid, true, &format!("merge: fast-forward to {branch}"))
+            .map_err(|e| e.to_string())?;
+        repo.set_head(&refname).map_err(|e| e.to_string())?;
+        let commit = repo.find_commit(oid).map_err(|e| e.to_string())?;
+        repo.checkout_tree(
+            commit.as_object(),
+            Some(git2::build::CheckoutBuilder::new().force()),
+        )
+        .map_err(|e| e.to_string())?;
+        return Ok(MergeResult {
+            status: "fastForward".into(),
+            message: format!("已快进合并「{branch}」到「{current}」"),
+            conflicts: vec![],
+        });
+    }
+
+    // Perform the merge into the index / workdir (does not commit yet).
+    repo.merge(&[&annotated], None, None)
         .map_err(|e| e.to_string())?;
 
-    Ok("merge successful".to_string())
+    let conflicts = index_conflict_paths(&repo);
+    if !conflicts.is_empty() {
+        return Ok(MergeResult {
+            status: "conflicts".into(),
+            message: format!(
+                "合并「{branch}」到「{current}」时有 {} 个冲突，请在 Changes 中解决",
+                conflicts.len()
+            ),
+            conflicts,
+        });
+    }
+
+    let mut index = repo.index().map_err(|e| e.to_string())?;
+    let tree_id = index.write_tree().map_err(|e| e.to_string())?;
+    let tree = repo.find_tree(tree_id).map_err(|e| e.to_string())?;
+    let head_commit = repo
+        .head()
+        .and_then(|h| h.peel_to_commit())
+        .map_err(|e| e.to_string())?;
+    let merge_commit = repo.find_commit(oid).map_err(|e| e.to_string())?;
+
+    if head_commit.id() == oid {
+        return Ok(MergeResult {
+            status: "upToDate".into(),
+            message: format!("「{branch}」已是最新，无需合并"),
+            conflicts: vec![],
+        });
+    }
+
+    let sig = repo.signature().map_err(|e| e.to_string())?;
+    let msg = format!("Merge branch '{branch}' into {current}");
+    let new_id = repo
+        .commit(Some("HEAD"), &sig, &sig, &msg, &tree, &[&head_commit, &merge_commit])
+        .map_err(|e| e.to_string())?;
+
+    // Sync workdir with the new merge commit.
+    let new_commit = repo.find_commit(new_id).map_err(|e| e.to_string())?;
+    repo.checkout_tree(
+        new_commit.as_object(),
+        Some(git2::build::CheckoutBuilder::new().force()),
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(MergeResult {
+        status: "merged".into(),
+        message: format!("已将「{branch}」合并到「{current}」"),
+        conflicts: vec![],
+    })
+}
+
+/// Abort an in-progress merge (equivalent to `git merge --abort`).
+#[tauri::command]
+fn abort_merge(repo_path: String) -> Result<String, String> {
+    // Prefer system git for a full, correct abort (cleans MERGE_HEAD etc.).
+    match run_git(&repo_path, &["merge", "--abort"]) {
+        Ok(_) => Ok("已中止合并".to_string()),
+        Err(e) => {
+            // Fallback: hard reset to HEAD if merge --abort is unavailable.
+            if e.contains("There is no merge to abort") || e.contains("MERGE_HEAD") {
+                return Ok("当前没有进行中的合并".to_string());
+            }
+            let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
+            let head = repo
+                .head()
+                .and_then(|h| h.peel_to_commit())
+                .map_err(|_| "无法中止：没有可重置的 HEAD".to_string())?;
+            repo.reset(head.as_object(), git2::ResetType::Hard, None)
+                .map_err(|e| format!("中止合并失败: {e}"))?;
+            Ok("已中止合并（hard reset）".to_string())
+        }
+    }
 }
 
 #[tauri::command]
@@ -715,6 +900,111 @@ fn get_log(repo_path: String, limit: Option<u32>) -> Result<Vec<CommitSummary>, 
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct CommitFile {
+    path: String,
+    /// One of: added, deleted, modified, renamed, typechange.
+    status: String,
+    /// New path if renamed, else empty.
+    new_path: String,
+}
+
+fn blob_to_string(repo: &git2::Repository, id: git2::Oid) -> Result<String, String> {
+    match repo.find_blob(id) {
+        Ok(b) => Ok(String::from_utf8_lossy(b.content()).into_owned()),
+        Err(_) => Ok(String::new()),
+    }
+}
+
+fn tree_blob(tree: &git2::Tree, path: &str) -> Option<git2::Oid> {
+    tree.get_path(Path::new(path)).ok().map(|e| e.id())
+}
+
+/// List files changed in a single commit (diff against its first parent).
+#[tauri::command]
+fn get_commit_files(repo_path: String, commit_id: String) -> Result<Vec<CommitFile>, String> {
+    let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
+    let oid: git2::Oid = commit_id.parse().map_err(|e| format!("bad commit id: {e}"))?;
+    let commit = repo.find_commit(oid).map_err(|e| e.to_string())?;
+    let new_tree = commit.tree().map_err(|e| e.to_string())?;
+    let old_tree = if commit.parent_count() > 0 {
+        Some(commit.parent(0).map_err(|e| e.to_string())?.tree().map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+
+    let mut diff_opts = git2::DiffOptions::new();
+    let mut files = Vec::new();
+    let diff = repo.diff_tree_to_tree(
+        old_tree.as_ref(),
+        Some(&new_tree),
+        Some(&mut diff_opts),
+    )
+    .map_err(|e| e.to_string())?;
+
+    for delta in diff.deltas() {
+        let old_path = delta
+            .old_file()
+            .path()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let new_path = delta
+            .new_file()
+            .path()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let status = match delta.status() {
+            git2::Delta::Added => "added",
+            git2::Delta::Deleted => "deleted",
+            git2::Delta::Renamed => "renamed",
+            git2::Delta::Typechange => "typechange",
+            _ => "modified",
+        };
+        let path = if new_path.is_empty() { old_path.clone() } else { new_path.clone() };
+        files.push(CommitFile {
+            path,
+            status: status.to_string(),
+            new_path: if status == "renamed" { new_path } else { String::new() },
+        });
+    }
+    Ok(files)
+}
+
+/// Side-by-side diff of one file inside a commit (parent tree vs commit tree).
+#[tauri::command]
+fn get_commit_file_diff(
+    repo_path: String,
+    commit_id: String,
+    path: String,
+) -> Result<FileDiff, String> {
+    let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
+    let oid: git2::Oid = commit_id.parse().map_err(|e| format!("bad commit id: {e}"))?;
+    let commit = repo.find_commit(oid).map_err(|e| e.to_string())?;
+    let new_tree = commit.tree().map_err(|e| e.to_string())?;
+    let old_tree = if commit.parent_count() > 0 {
+        Some(commit.parent(0).map_err(|e| e.to_string())?.tree().map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+
+    let old_content = old_tree
+        .as_ref()
+        .and_then(|t| tree_blob(t, &path))
+        .map(|id| blob_to_string(&repo, id))
+        .unwrap_or_else(|| Ok(String::new()))?;
+    let new_content = tree_blob(&new_tree, &path)
+        .map(|id| blob_to_string(&repo, id))
+        .unwrap_or_else(|| Ok(String::new()))?;
+
+    let ops = diff_strings(&old_content, &new_content)
+        .into_iter()
+        .map(|(k, t)| (k, t.to_string()))
+        .collect();
+    let rows = align_rows(ops);
+    Ok(FileDiff { path, rows })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct BranchInfo {
     name: String,
     is_current: bool,
@@ -779,82 +1069,100 @@ fn delete_branch(repo_path: String, name: String) -> Result<String, String> {
     Ok(format!("deleted branch {name}"))
 }
 
-fn ssh_key_cred(username: &str) -> Result<git2::Cred, git2::Error> {
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_default();
-    for fname in ["id_ed25519", "id_rsa"] {
-        let path = std::path::Path::new(&home).join(".ssh").join(fname);
-        if path.exists() {
-            return git2::Cred::ssh_key(username, None, &path, None);
-        }
+/// Run a system `git` subcommand in `repo_path` and return trimmed stdout.
+/// Network operations (push/fetch/pull) use the system git client because
+/// libssh2 on Windows cannot load OpenSSH-format ed25519 keys (git2-rs #659).
+fn run_git(repo_path: &str, args: &[&str]) -> Result<String, String> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(repo_path)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("failed to spawn git: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if !out.status.success() {
+        let msg = if !stderr.is_empty() { stderr } else { stdout };
+        return Err(if msg.is_empty() {
+            format!("git {:?} failed with {}", args, out.status)
+        } else {
+            msg
+        });
     }
-    git2::Cred::ssh_key_from_agent(username)
+    Ok(stdout)
 }
 
-fn remote_callbacks() -> git2::RemoteCallbacks<'static> {
-    let mut callbacks = git2::RemoteCallbacks::new();
-    callbacks.credentials(|_url, username_from_url, _allowed_types| {
-        let user = username_from_url.unwrap_or("git");
-        ssh_key_cred(user)
-    });
-    callbacks
+fn nonempty(v: Option<String>, default: &str) -> String {
+    v.filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
+#[tauri::command]
+fn push(repo_path: String, remote: Option<String>, branch: Option<String>) -> Result<String, String> {
+    let remote_name = nonempty(remote, "origin");
+    let branch_name = branch
+        .filter(|b| !b.trim().is_empty())
+        .map(|b| b)
+        .unwrap_or_else(|| {
+            // Fall back to current branch for -u detection / messaging.
+            git2::Repository::open(&repo_path)
+                .ok()
+                .and_then(|r| repo_head_name(&r).ok())
+                .unwrap_or_default()
+        });
+
+    // Detect whether the current branch has an upstream; if not, push -u.
+    let has_upstream = run_git(
+        &repo_path,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    .is_ok();
+
+    let mut args: Vec<String> = vec!["push".into()];
+    if !has_upstream {
+        args.push("-u".into());
+    }
+    args.push(remote_name.clone());
+    if !branch_name.is_empty() && branch_name != "detached" && !branch_name.starts_with("HEAD") {
+        args.push(branch_name.clone());
+    }
+
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let out = run_git(&repo_path, &arg_refs)?;
+    let msg = if out.is_empty() || out.contains("Everything up-to-date") {
+        format!(
+            "pushed {} to {remote_name}{}",
+            if branch_name.is_empty() { "current branch" } else { &branch_name },
+            if has_upstream { "" } else { " (set upstream)" }
+        )
+    } else {
+        out
+    };
+    Ok(msg)
 }
 
 #[tauri::command]
 fn fetch(repo_path: String, remote: Option<String>) -> Result<String, String> {
-    let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
-    let remote_name = remote
-        .filter(|r| !r.trim().is_empty())
-        .unwrap_or_else(|| "origin".to_string());
-    let mut remote = repo.find_remote(&remote_name).map_err(|e| e.to_string())?;
-
-    let mut fetch_opts = git2::FetchOptions::new();
-    fetch_opts.remote_callbacks(remote_callbacks());
-
-    let refspec = format!("+refs/heads/*:refs/remotes/{remote_name}/*");
-    remote.fetch(&[&refspec], Some(&mut fetch_opts), None)
-        .map_err(|e| e.to_string())?;
+    let remote_name = nonempty(remote, "origin");
+    run_git(&repo_path, &["fetch", &remote_name])?;
     Ok(format!("fetched from {remote_name}"))
 }
 
 #[tauri::command]
 fn pull(repo_path: String, remote: Option<String>, branch: Option<String>) -> Result<String, String> {
-    let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
-    let remote_name = remote
-        .filter(|r| !r.trim().is_empty())
-        .unwrap_or_else(|| "origin".to_string());
-    let branch_name = match branch.filter(|b| !b.trim().is_empty()) {
-        Some(b) => b,
-        None => repo_head_name(&repo)?,
-    };
-
-    let mut remote = repo.find_remote(&remote_name).map_err(|e| e.to_string())?;
-    let mut fetch_opts = git2::FetchOptions::new();
-    fetch_opts.remote_callbacks(remote_callbacks());
-    let refspec = format!("+refs/heads/*:refs/remotes/{remote_name}/*");
-    remote.fetch(&[&refspec], Some(&mut fetch_opts), None)
-        .map_err(|e| e.to_string())?;
-
-    let fetch_commit = repo.find_reference(&format!("refs/remotes/{remote_name}/{branch_name}"))
-        .and_then(|r| r.peel_to_commit())
-        .map_err(|e| e.to_string())?;
-
-    let annotated = repo.find_annotated_commit(fetch_commit.id()).map_err(|e| e.to_string())?;
-    repo.merge(&[&annotated], None, None).map_err(|e| e.to_string())?;
-
-    if repo.index().map_err(|e| e.to_string())?.has_conflicts() {
-        return Ok("pull resulted in conflicts".to_string());
+    let remote_name = nonempty(remote, "origin");
+    let branch_name = branch.filter(|b| !b.trim().is_empty());
+    let mut args = vec!["pull", &remote_name];
+    if let Some(b) = &branch_name {
+        args.push(b);
     }
-
-    let head_commit = repo.head().and_then(|h| h.peel_to_commit()).map_err(|e| e.to_string())?;
-    let sig = repo.signature().map_err(|e| e.to_string())?;
-    let tree = repo.index().map_err(|e| e.to_string())?.write_tree().map_err(|e| e.to_string())?;
-    let tree = repo.find_tree(tree).map_err(|e| e.to_string())?;
-    repo.commit(Some("HEAD"), &sig, &sig, "Merge branch", &tree, &[&head_commit, &fetch_commit])
-        .map_err(|e| e.to_string())?;
-
-    Ok(format!("pulled {branch_name} from {remote_name}"))
+    run_git(&repo_path, &args)?;
+    Ok(format!(
+        "pulled {} from {remote_name}",
+        branch_name.unwrap_or_else(|| "current branch".to_string())
+    ))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -867,6 +1175,7 @@ pub fn run() {
             commit,
             push,
             merge,
+            abort_merge,
             get_status,
             stage,
             unstage,
@@ -874,12 +1183,15 @@ pub fn run() {
             get_file_contents,
             get_diff,
             get_log,
+            get_commit_files,
+            get_commit_file_diff,
             list_branches,
             checkout,
             create_branch,
             delete_branch,
             fetch,
             pull,
+            discard,
             write_file
         ])
         .run(tauri::generate_context!())

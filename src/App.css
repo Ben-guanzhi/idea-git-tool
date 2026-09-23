@@ -83,9 +83,19 @@ button {
   font-weight: 500;
 }
 
-.btn:hover {
+.btn:hover:not(:disabled) {
   background: #eef2f7;
   border-color: #1976d2;
+}
+
+.btn.primary {
+  background: #1976d2;
+  border-color: #1976d2;
+  color: #fff;
+}
+
+.btn.primary:hover:not(:disabled) {
+  background: #1565c0;
 }
 
 .ide-error {
@@ -167,6 +177,7 @@ button {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 6px;
   padding: 4px 8px;
   background: #eceff1;
   border-bottom: 1px solid #e0e0e0;
@@ -391,8 +402,309 @@ button {
   background: #1976d2;
 }
 
-.commit-btn:hover {
+.commit-btn:hover:not(:disabled) {
   background: #1565c0;
+}
+
+.commit-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.commit-side {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: stretch;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.commit-hint {
+  font-size: 0.75em;
+  white-space: nowrap;
+}
+
+.bulk-btn {
+  font-size: 0.75em;
+  padding: 1px 5px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+}
+
+.bulk-btn:hover:not(:disabled) {
+  border-color: #1976d2;
+  background: #e3f0fd;
+}
+
+.bulk-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.discard-btn {
+  color: #c62828;
+  font-weight: 700;
+}
+
+.discard-btn:hover {
+  background: #fdecea;
+  color: #b71c1c;
+}
+
+.ide-error,
+.ide-info {
+  max-height: 72px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* File tree */
+.tree-list {
+  padding-bottom: 4px;
+}
+
+.tree-dir-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+  font-size: 0.85em;
+  font-weight: 600;
+  user-select: none;
+}
+
+.tree-dir-row:hover {
+  background: #e8eef5;
+}
+
+.tree-caret {
+  display: inline-block;
+  width: 10px;
+  font-size: 0.7em;
+  color: #777;
+  transform: rotate(0deg);
+  transition: transform 0.1s;
+}
+
+.tree-caret.open {
+  transform: rotate(90deg);
+}
+
+.tree-dir-icon {
+  font-size: 0.9em;
+  width: 16px;
+  text-align: center;
+}
+
+.tree-dir-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tree-list .file-item {
+  padding-right: 4px;
+}
+
+/* Tri-state checkbox for bulk tree selection */
+.cb {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  margin: 0;
+  border: 1px solid #90a4ae;
+  border-radius: 3px;
+  background: #fff;
+  color: #fff;
+  font-size: 9px;
+  line-height: 12px;
+  text-align: center;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.cb:hover {
+  border-color: #1976d2;
+}
+
+.cb-on {
+  background: #1976d2;
+  border-color: #1976d2;
+  color: #fff;
+}
+
+.cb-partial {
+  background: #e3f0fd;
+  border-color: #1976d2;
+  color: #1976d2;
+  font-weight: 700;
+}
+
+.cb-off {
+  background: #fff;
+}
+
+.tree-dir-count {
+  font-size: 0.75em;
+  font-weight: 400;
+  margin-left: auto;
+}
+
+.ops-toolbar-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+/* Git operation log panel */
+.ops-panel {
+  flex-shrink: 0;
+  background: #f7f8fa;
+  border-top: 1px solid #ddd;
+}
+
+.ops-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  border: none;
+  background: transparent;
+  padding: 4px 12px;
+  cursor: pointer;
+  font-size: 0.8em;
+  font-weight: 600;
+  color: #555;
+  text-align: left;
+}
+
+.ops-toggle:hover {
+  background: #eef2f7;
+}
+
+.ops-caret {
+  display: inline-block;
+  transition: transform 0.1s;
+  color: #777;
+}
+
+.ops-caret.open {
+  transform: rotate(90deg);
+}
+
+.ops-badge {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  margin-left: 4px;
+}
+
+.ops-count {
+  background: #c5cae9;
+  color: #303f9f;
+  border-radius: 8px;
+  padding: 0 6px;
+  font-size: 0.75em;
+  font-weight: 700;
+}
+
+.ops-err-count {
+  background: #ffcdd2;
+  color: #b71c1c;
+  border-radius: 8px;
+  padding: 0 6px;
+  font-size: 0.75em;
+  font-weight: 700;
+}
+
+.ops-body {
+  border-top: 1px solid #e0e0e0;
+  max-height: 160px;
+  display: flex;
+  flex-direction: column;
+}
+
+.ops-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 10px;
+  background: #eceff1;
+  border-bottom: 1px solid #e0e0e0;
+  flex-shrink: 0;
+}
+
+.ops-title {
+  font-size: 0.8em;
+  font-weight: 600;
+}
+
+.ops-list {
+  overflow-y: auto;
+  font-family: "SFMono-Regular", Consolas, Menlo, monospace;
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.ops-row {
+  display: grid;
+  grid-template-columns: 72px 80px 14px 1fr;
+  gap: 6px;
+  padding: 2px 10px;
+  border-bottom: 1px solid #eee;
+  align-items: baseline;
+}
+
+.ops-row:hover {
+  background: #eef2f7;
+}
+
+.ops-time {
+  color: #888;
+}
+
+.ops-op {
+  font-weight: 600;
+  color: #37474f;
+}
+
+.ops-status {
+  text-align: center;
+  font-weight: 700;
+}
+
+.ops-ok .ops-status {
+  color: #2e7d32;
+}
+
+.ops-error .ops-status {
+  color: #c62828;
+}
+
+.ops-info .ops-status {
+  color: #1976d2;
+}
+
+.ops-error .ops-detail {
+  color: #b71c1c;
+}
+
+.ops-detail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #555;
+}
+
+.ops-empty {
+  padding: 8px 10px;
+  font-size: 0.85em;
 }
 
 /* Conflict resolve buttons */
@@ -412,20 +724,47 @@ button {
 .log-pane {
   flex: 1;
   min-height: 0;
-  overflow: auto;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.log-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
 }
 
 .log-list {
+  flex: 0 0 280px;
+  min-width: 0;
+  overflow: auto;
   padding: 8px;
+  border-right: 1px solid #ddd;
 }
 
 .log-item {
   padding: 6px 8px;
   border-bottom: 1px solid #eee;
+  cursor: pointer;
 }
 
 .log-item:hover {
   background: #f5f7fa;
+}
+
+.log-item.selected {
+  background: #e3f0fd;
+  border-left: 3px solid #1976d2;
+  padding-left: 5px;
+}
+
+.commit-files {
+  flex: 0 0 240px;
+  min-width: 0;
+  overflow: auto;
+  border-right: 1px solid #ddd;
+  background: #fafbfc;
 }
 
 .log-refs {
@@ -461,6 +800,35 @@ button {
   background: #f7f8fa;
   border-top: 1px solid #ddd;
   flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.branch-actions-label {
+  font-size: 0.8em;
+  font-weight: 600;
+  color: #555;
+}
+
+.branch-actions-divider {
+  width: 1px;
+  height: 22px;
+  background: #ccc;
+  margin: 0 4px;
+}
+
+.btn.abort {
+  background: #c62828;
+  color: #fff;
+  border-color: #c62828;
+}
+
+.btn.abort:hover {
+  background: #b71c1c;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .small-input {
@@ -512,8 +880,18 @@ button {
     color: #e6e6e6;
   }
 
-  .btn:hover {
+  .btn:hover:not(:disabled) {
     background: #4a4a4a;
+  }
+
+  .btn.primary {
+    background: #1976d2;
+    border-color: #1976d2;
+    color: #fff;
+  }
+
+  .btn.primary:hover:not(:disabled) {
+    background: #1565c0;
   }
 
   .ide-tabs {
@@ -538,6 +916,35 @@ button {
   .file-group-header {
     background: #303030;
     border-color: #444;
+  }
+
+  .cb {
+    background: #1e1e1e;
+    border-color: #666;
+  }
+
+  .cb-on {
+    background: #1976d2;
+    border-color: #1976d2;
+  }
+
+  .cb-partial {
+    background: #1f3a5f;
+    border-color: #4d9de0;
+    color: #9ecfff;
+  }
+
+  .cb-off {
+    background: #1e1e1e;
+  }
+
+  .tree-dir-row:hover {
+    background: #2a2d2e;
+  }
+
+  .ops-toolbar-actions {
+    display: flex;
+    gap: 6px;
   }
 
   .file-item:hover {
@@ -626,8 +1033,30 @@ button {
     background: #252526;
   }
 
+  .log-item.selected {
+    background: #094771;
+    border-left-color: #1976d2;
+  }
+
+  .log-list {
+    border-right-color: #333;
+  }
+
+  .commit-files {
+    background: #252526;
+    border-right-color: #333;
+  }
+
   .log-meta {
     color: #999;
+  }
+
+  .branch-actions-label {
+    color: #aaa;
+  }
+
+  .branch-actions-divider {
+    background: #555;
   }
 
   .mini-btn {
@@ -636,5 +1065,73 @@ button {
 
   .mini-btn:hover {
     background: #444;
+  }
+
+  .ops-panel {
+    background: #252526;
+    border-top-color: #444;
+  }
+
+  .ops-toggle {
+    color: #aaa;
+  }
+
+  .ops-toggle:hover {
+    background: #2d2d30;
+  }
+
+  .ops-caret {
+    color: #888;
+  }
+
+  .ops-count {
+    background: #3a3f5a;
+    color: #b0b8ff;
+  }
+
+  .ops-err-count {
+    background: #5c2424;
+    color: #f3a6a6;
+  }
+
+  .ops-body {
+    border-top-color: #444;
+  }
+
+  .ops-toolbar {
+    background: #303030;
+    border-bottom-color: #444;
+  }
+
+  .ops-row {
+    border-bottom-color: #333;
+  }
+
+  .ops-row:hover {
+    background: #2d2d30;
+  }
+
+  .ops-time {
+    color: #777;
+  }
+
+  .ops-op {
+    color: #bbb;
+  }
+
+  .ops-detail {
+    color: #999;
+  }
+
+  .ops-error .ops-detail {
+    color: #f3a6a6;
+  }
+
+  .tree-dir-row:hover {
+    background: #2a2d2e;
+  }
+
+  .tree-caret {
+    color: #888;
   }
 }
