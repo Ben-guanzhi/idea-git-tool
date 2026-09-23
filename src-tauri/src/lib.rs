@@ -63,7 +63,13 @@ fn sig_for(repo: &git2::Repository, name: &str, email: &str) -> Result<git2::Sig
     if !name.is_empty() && !email.is_empty() {
         git2::Signature::now(name, email).map_err(|e| e.to_string())
     } else {
-        repo.signature().map_err(|e| e.to_string())
+        repo.signature().map_err(|e| {
+            format!(
+                "无法获取提交作者签名（git user.name / user.email 未配置）: {e}。\
+                 请运行: git config --global user.name \"你的名字\" && \
+                 git config --global user.email \"你的邮箱\""
+            )
+        })
     }
 }
 
@@ -257,9 +263,11 @@ fn commit(args: CommitArgs) -> Result<String, String> {
 #[tauri::command]
 fn push(repo_path: String, remote: Option<String>, branch: Option<String>) -> Result<String, String> {
     let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
-    let remote_name = remote.unwrap_or_else(|| "origin".to_string());
+    let remote_name = remote
+        .filter(|r| !r.trim().is_empty())
+        .unwrap_or_else(|| "origin".to_string());
     let mut remote = repo.find_remote(&remote_name).map_err(|e| e.to_string())?;
-    let branch_name = match branch {
+    let branch_name = match branch.filter(|b| !b.trim().is_empty()) {
         Some(b) => b,
         None => repo_head_name(&repo)?,
     };
@@ -267,7 +275,8 @@ fn push(repo_path: String, remote: Option<String>, branch: Option<String>) -> Re
 
     let mut callbacks = git2::RemoteCallbacks::new();
     callbacks.credentials(|_url, username_from_url, _allowed_types| {
-        git2::Cred::ssh_key_from_agent(username_from_url.unwrap_or("git"))
+        let user = username_from_url.unwrap_or("git");
+        ssh_key_cred(user)
     });
     let mut push_options = git2::PushOptions::new();
     push_options.remote_callbacks(callbacks);
@@ -770,10 +779,24 @@ fn delete_branch(repo_path: String, name: String) -> Result<String, String> {
     Ok(format!("deleted branch {name}"))
 }
 
+fn ssh_key_cred(username: &str) -> Result<git2::Cred, git2::Error> {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_default();
+    for fname in ["id_ed25519", "id_rsa"] {
+        let path = std::path::Path::new(&home).join(".ssh").join(fname);
+        if path.exists() {
+            return git2::Cred::ssh_key(username, None, &path, None);
+        }
+    }
+    git2::Cred::ssh_key_from_agent(username)
+}
+
 fn remote_callbacks() -> git2::RemoteCallbacks<'static> {
     let mut callbacks = git2::RemoteCallbacks::new();
     callbacks.credentials(|_url, username_from_url, _allowed_types| {
-        git2::Cred::ssh_key_from_agent(username_from_url.unwrap_or("git"))
+        let user = username_from_url.unwrap_or("git");
+        ssh_key_cred(user)
     });
     callbacks
 }
@@ -781,7 +804,9 @@ fn remote_callbacks() -> git2::RemoteCallbacks<'static> {
 #[tauri::command]
 fn fetch(repo_path: String, remote: Option<String>) -> Result<String, String> {
     let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
-    let remote_name = remote.unwrap_or_else(|| "origin".to_string());
+    let remote_name = remote
+        .filter(|r| !r.trim().is_empty())
+        .unwrap_or_else(|| "origin".to_string());
     let mut remote = repo.find_remote(&remote_name).map_err(|e| e.to_string())?;
 
     let mut fetch_opts = git2::FetchOptions::new();
@@ -796,8 +821,10 @@ fn fetch(repo_path: String, remote: Option<String>) -> Result<String, String> {
 #[tauri::command]
 fn pull(repo_path: String, remote: Option<String>, branch: Option<String>) -> Result<String, String> {
     let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
-    let remote_name = remote.unwrap_or_else(|| "origin".to_string());
-    let branch_name = match branch {
+    let remote_name = remote
+        .filter(|r| !r.trim().is_empty())
+        .unwrap_or_else(|| "origin".to_string());
+    let branch_name = match branch.filter(|b| !b.trim().is_empty()) {
         Some(b) => b,
         None => repo_head_name(&repo)?,
     };
