@@ -1,11 +1,54 @@
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
+use serde::{Deserialize, Serialize};
+use std::path::{Component, Path, PathBuf};
+
+/// Resolve a repo-relative path against the workdir, rejecting absolute paths
+/// and `..` traversal. libgit2's `index.add_path` refuses paths outside the
+/// workdir on its own, but the direct `std::fs` calls in `write_file`,
+/// `discard`, `resolve_conflict` and `get_file_contents` must not become
+/// arbitrary read/write/delete primitives: a `../` path would otherwise
+/// escape the repository entirely.
+fn resolve_in_workdir(repo: &git2::Repository, path: &str) -> Result<PathBuf, String> {
+    validate_rel_path(path)?;
+    repo.workdir()
+        .map(|w| w.join(path))
+        .ok_or_else(|| "repository has no workdir".to_string())
 }
 
-use serde::{Deserialize, Serialize};
-use std::path::Path;
+/// Open the repository at `repo_path`, mapping the error to the string the
+/// command boundary carries. Every command used to repeat this mapping.
+fn open_repo(repo_path: &str) -> Result<git2::Repository, String> {
+    git2::Repository::open(repo_path).map_err(|e| e.to_string())
+}
+
+/// Reject absolute paths, drive prefixes and `..`/root components outright.
+fn validate_rel_path(path: &str) -> Result<(), String> {
+    let p = Path::new(path);
+    if p.is_absolute()
+        || p.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(format!("非法路径「{path}」：必须位于仓库工作区内"));
+    }
+    Ok(())
+}
+
+/// Refuse to force-checkout over a dirty working tree. The git CLI protects
+/// uncommitted changes before a merge/checkout; without this check the
+/// `.force()` checkouts below would silently wipe them (data loss).
+/// Untracked-and-unstaged files (`WT_NEW` only) are allowed, matching git.
+fn ensure_clean_workdir(repo: &git2::Repository) -> Result<(), String> {
+    let statuses = repo.statuses(None).map_err(|e| e.to_string())?;
+    for entry in statuses.iter() {
+        if entry.status() != git2::Status::WT_NEW {
+            return Err("工作区有未提交的修改，请先提交或暂存（stash）后再执行该操作".to_string());
+        }
+    }
+    Ok(())
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,7 +90,9 @@ struct FileStatus {
 fn repo_head_name(repo: &git2::Repository) -> Result<String, String> {
     if repo.head_detached().map_err(|e| e.to_string())? {
         let oid = repo.head().map_err(|e| e.to_string())?.target();
-        Ok(oid.map(|o| format!("HEAD detached at {}", o.to_string())).unwrap_or_else(|| "detached".to_string()))
+        Ok(oid
+            .map(|o| format!("HEAD detached at {}", o.to_string()))
+            .unwrap_or_else(|| "detached".to_string()))
     } else {
         match repo.head() {
             Ok(h) => match h.shorthand() {
@@ -59,7 +104,11 @@ fn repo_head_name(repo: &git2::Repository) -> Result<String, String> {
     }
 }
 
-fn sig_for(repo: &git2::Repository, name: &str, email: &str) -> Result<git2::Signature<'static>, String> {
+fn sig_for(
+    repo: &git2::Repository,
+    name: &str,
+    email: &str,
+) -> Result<git2::Signature<'static>, String> {
     if !name.is_empty() && !email.is_empty() {
         git2::Signature::now(name, email).map_err(|e| e.to_string())
     } else {
@@ -87,18 +136,24 @@ fn delta_to_status(d: git2::Delta) -> &'static str {
 
 #[tauri::command]
 fn get_status(repo_path: String) -> Result<StatusInfo, String> {
-    let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
+    let repo = open_repo(&repo_path)?;
 
     let branch = repo_head_name(&repo)?;
 
     let (upstream, ahead, behind) = {
         let head = repo.head().ok();
-        let branch = head.as_ref().and_then(|h| repo.find_branch(h.shorthand().unwrap_or(""), git2::BranchType::Local).ok());
+        let branch = head.as_ref().and_then(|h| {
+            repo.find_branch(h.shorthand().unwrap_or(""), git2::BranchType::Local)
+                .ok()
+        });
         let up = branch.and_then(|b| b.upstream().ok());
         match up {
             Some(u) => {
                 let up_name = u.name().ok().flatten().map(str::to_owned);
-                let local_oid = head.as_ref().and_then(|h| h.target()).unwrap_or(git2::Oid::zero());
+                let local_oid = head
+                    .as_ref()
+                    .and_then(|h| h.target())
+                    .unwrap_or(git2::Oid::zero());
                 let (a, b) = repo
                     .graph_ahead_behind(local_oid, u.get().target().unwrap_or(git2::Oid::zero()))
                     .unwrap_or((0, 0));
@@ -119,17 +174,35 @@ fn get_status(repo_path: String) -> Result<StatusInfo, String> {
         let path = s.path().map(|p| p.to_string()).unwrap_or_default();
         let st = s.status();
         let is_conflicted = st.contains(git2::Status::CONFLICTED);
-        if st.is_index_new() || st.is_index_modified() || st.is_index_deleted() || st.is_index_renamed() || st.is_index_typechange() {
+        if st.is_index_new()
+            || st.is_index_modified()
+            || st.is_index_deleted()
+            || st.is_index_renamed()
+            || st.is_index_typechange()
+        {
             staged.push(FileStatus {
                 path: path.clone(),
-                status: s.head_to_index().map(|d| delta_to_status(d.status())).unwrap_or("modified").to_string(),
+                status: s
+                    .head_to_index()
+                    .map(|d| delta_to_status(d.status()))
+                    .unwrap_or("modified")
+                    .to_string(),
             });
         }
-        if st.is_wt_new() || st.is_wt_modified() || st.is_wt_deleted() || st.is_wt_renamed() || st.is_wt_typechange() || is_conflicted {
+        if st.is_wt_new()
+            || st.is_wt_modified()
+            || st.is_wt_deleted()
+            || st.is_wt_renamed()
+            || st.is_wt_typechange()
+            || is_conflicted
+        {
             let status = if is_conflicted {
                 "conflicted".to_string()
             } else {
-                s.index_to_workdir().map(|d| delta_to_status(d.status())).unwrap_or("modified").to_string()
+                s.index_to_workdir()
+                    .map(|d| delta_to_status(d.status()))
+                    .unwrap_or("modified")
+                    .to_string()
             };
             unstaged.push(FileStatus {
                 path: path.clone(),
@@ -154,7 +227,7 @@ fn get_status(repo_path: String) -> Result<StatusInfo, String> {
 
 #[tauri::command]
 fn stage(repo_path: String, paths: Vec<String>) -> Result<(), String> {
-    let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
+    let repo = open_repo(&repo_path)?;
     let mut index = repo.index().map_err(|e| e.to_string())?;
     let workdir = repo.workdir().map(|w| w.to_path_buf());
     for p in &paths {
@@ -174,17 +247,16 @@ fn stage(repo_path: String, paths: Vec<String>) -> Result<(), String> {
 /// Discard working-tree / index changes for paths: restore from HEAD, or delete untracked.
 #[tauri::command]
 fn discard(repo_path: String, paths: Vec<String>) -> Result<(), String> {
-    let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
+    let repo = open_repo(&repo_path)?;
     let head_tree = repo
         .head()
         .ok()
         .and_then(|h| h.peel_to_commit().ok())
         .and_then(|c| c.tree().ok());
-    let workdir = repo.workdir().map(|w| w.to_path_buf());
     let mut index = repo.index().map_err(|e| e.to_string())?;
 
     for p in &paths {
-        let abs = workdir.as_ref().map(|w| w.join(p));
+        let abs = resolve_in_workdir(&repo, p)?;
         let in_index = index.get_path(Path::new(p), 0).is_some();
         let in_head = head_tree
             .as_ref()
@@ -193,12 +265,10 @@ fn discard(repo_path: String, paths: Vec<String>) -> Result<(), String> {
         match in_head {
             Some(entry) => {
                 let blob = repo.find_blob(entry.id()).map_err(|e| e.to_string())?;
-                if let Some(abs) = &abs {
-                    if let Some(parent) = abs.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    std::fs::write(abs, blob.content()).map_err(|e| e.to_string())?;
+                if let Some(parent) = abs.parent() {
+                    let _ = std::fs::create_dir_all(parent);
                 }
+                std::fs::write(&abs, blob.content()).map_err(|e| e.to_string())?;
                 // Always re-add: covers staged deletions (path missing from index).
                 index.add_path(Path::new(p)).map_err(|e| e.to_string())?;
             }
@@ -207,10 +277,8 @@ fn discard(repo_path: String, paths: Vec<String>) -> Result<(), String> {
                 if in_index {
                     index.remove_path(Path::new(p)).map_err(|e| e.to_string())?;
                 }
-                if let Some(abs) = &abs {
-                    if abs.exists() {
-                        std::fs::remove_file(abs).map_err(|e| e.to_string())?;
-                    }
+                if abs.exists() {
+                    std::fs::remove_file(&abs).map_err(|e| e.to_string())?;
                 }
             }
         }
@@ -221,7 +289,7 @@ fn discard(repo_path: String, paths: Vec<String>) -> Result<(), String> {
 
 #[tauri::command]
 fn unstage(repo_path: String, paths: Vec<String>) -> Result<(), String> {
-    let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
+    let repo = open_repo(&repo_path)?;
     let head_commit = repo.head().and_then(|h| h.peel_to_commit()).ok();
 
     match head_commit {
@@ -246,12 +314,15 @@ fn unstage(repo_path: String, paths: Vec<String>) -> Result<(), String> {
 /// `choice` is "ours" or "theirs".
 #[tauri::command]
 fn resolve_conflict(repo_path: String, paths: Vec<String>, choice: String) -> Result<(), String> {
-    let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
+    let repo = open_repo(&repo_path)?;
     let mut index = repo.index().map_err(|e| e.to_string())?;
 
     for p in &paths {
         let path = Path::new(p);
-        let ours_id = index.get_path(path, 1).or_else(|| index.get_path(path, 0)).map(|e| e.id);
+        let ours_id = index
+            .get_path(path, 1)
+            .or_else(|| index.get_path(path, 0))
+            .map(|e| e.id);
         let theirs_id = index.get_path(path, 2).map(|e| e.id);
 
         let chosen_id = match choice.as_str() {
@@ -260,23 +331,19 @@ fn resolve_conflict(repo_path: String, paths: Vec<String>, choice: String) -> Re
             _ => ours_id.or(theirs_id),
         };
 
-        let abs = repo.workdir().map(|w| w.join(p));
+        let abs = resolve_in_workdir(&repo, p)?;
 
         match chosen_id {
             Some(id) => {
                 if let Ok(blob) = repo.find_blob(id) {
-                    if let Some(abs) = &abs {
-                        let _ = std::fs::write(abs, blob.content());
-                    }
+                    let _ = std::fs::write(&abs, blob.content());
                     // Stage the resolved working file.
                     index.add_path(path).map_err(|e| e.to_string())?;
                 }
             }
             None => {
                 index.remove_path(path).map_err(|e| e.to_string())?;
-                if let Some(abs) = &abs {
-                    let _ = std::fs::remove_file(abs);
-                }
+                let _ = std::fs::remove_file(&abs);
             }
         }
     }
@@ -295,7 +362,9 @@ fn commit(args: CommitArgs) -> Result<String, String> {
     let head = repo.head().ok();
     let parent_commit = match head {
         Some(head_ref) => {
-            let oid = head_ref.target().ok_or_else(|| "head has no target".to_string())?;
+            let oid = head_ref
+                .target()
+                .ok_or_else(|| "head has no target".to_string())?;
             let parent = repo.find_commit(oid).map_err(|e| e.to_string())?;
             if parent.tree_id() == tree_id {
                 return Err("nothing to commit, working tree clean".to_string());
@@ -334,28 +403,44 @@ fn current_branch_name(repo: &git2::Repository) -> Result<String, String> {
     }
 }
 
-fn index_conflict_paths(repo: &git2::Repository) -> Vec<String> {
-    let index = match repo.index() {
-        Ok(i) => i,
-        Err(_) => return Vec::new(),
+/// One deduplicated record per conflicted path: `(path, our, their, ancestor)`,
+/// the path taken from the first side that exists.
+fn index_conflicts(
+    repo: &git2::Repository,
+) -> Vec<(
+    Vec<u8>,
+    Option<git2::IndexEntry>,
+    Option<git2::IndexEntry>,
+    Option<git2::IndexEntry>,
+)> {
+    let Ok(index) = repo.index() else {
+        return Vec::new();
+    };
+    let Ok(iter) = index.conflicts() else {
+        return Vec::new();
     };
     let mut out = Vec::new();
-    if let Ok(iter) = index.conflicts() {
-        for c in iter.flatten() {
-            if let Some(e) = c.our.as_ref().or(c.their.as_ref()).or(c.ancestor.as_ref()) {
-                let p = String::from_utf8_lossy(&e.path).into_owned();
-                if !out.contains(&p) {
-                    out.push(p);
-                }
+    let mut seen = std::collections::HashSet::new();
+    for c in iter.flatten() {
+        if let Some(e) = c.our.as_ref().or(c.their.as_ref()).or(c.ancestor.as_ref()) {
+            if seen.insert(e.path.clone()) {
+                out.push((e.path.clone(), c.our, c.their, c.ancestor));
             }
         }
     }
     out
 }
 
+fn index_conflict_paths(repo: &git2::Repository) -> Vec<String> {
+    index_conflicts(repo)
+        .iter()
+        .map(|(p, ..)| String::from_utf8_lossy(p).into_owned())
+        .collect()
+}
+
 #[tauri::command]
 fn merge(repo_path: String, branch: String) -> Result<MergeResult, String> {
-    let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
+    let repo = open_repo(&repo_path)?;
     let current = current_branch_name(&repo)?;
 
     if branch == current {
@@ -371,7 +456,9 @@ fn merge(repo_path: String, branch: String) -> Result<MergeResult, String> {
         .map_err(|e| format!("找不到分支「{branch}」: {e}"))?;
     let annotated = repo.find_annotated_commit(oid).map_err(|e| e.to_string())?;
 
-    let analysis = repo.merge_analysis(&[&annotated]).map_err(|e| e.to_string())?;
+    let analysis = repo
+        .merge_analysis(&[&annotated])
+        .map_err(|e| e.to_string())?;
     let a = analysis.0;
 
     if a.is_up_to_date() {
@@ -384,6 +471,7 @@ fn merge(repo_path: String, branch: String) -> Result<MergeResult, String> {
 
     if a.is_unborn() {
         // Current branch has no commits: fast-forward HEAD to the target.
+        ensure_clean_workdir(&repo)?;
         let refname = format!("refs/heads/{current}");
         repo.reference(&refname, oid, true, "merge: Fast-Forward")
             .map_err(|e| e.to_string())?;
@@ -407,9 +495,15 @@ fn merge(repo_path: String, branch: String) -> Result<MergeResult, String> {
 
     if a.is_fast_forward() {
         // Just move the branch pointer; no merge commit needed.
+        ensure_clean_workdir(&repo)?;
         let refname = format!("refs/heads/{current}");
-        repo.reference(&refname, oid, true, &format!("merge: fast-forward to {branch}"))
-            .map_err(|e| e.to_string())?;
+        repo.reference(
+            &refname,
+            oid,
+            true,
+            &format!("merge: fast-forward to {branch}"),
+        )
+        .map_err(|e| e.to_string())?;
         repo.set_head(&refname).map_err(|e| e.to_string())?;
         let commit = repo.find_commit(oid).map_err(|e| e.to_string())?;
         repo.checkout_tree(
@@ -460,10 +554,18 @@ fn merge(repo_path: String, branch: String) -> Result<MergeResult, String> {
     let sig = repo.signature().map_err(|e| e.to_string())?;
     let msg = format!("Merge branch '{branch}' into {current}");
     let new_id = repo
-        .commit(Some("HEAD"), &sig, &sig, &msg, &tree, &[&head_commit, &merge_commit])
+        .commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            &msg,
+            &tree,
+            &[&head_commit, &merge_commit],
+        )
         .map_err(|e| e.to_string())?;
 
     // Sync workdir with the new merge commit.
+    ensure_clean_workdir(&repo)?;
     let new_commit = repo.find_commit(new_id).map_err(|e| e.to_string())?;
     repo.checkout_tree(
         new_commit.as_object(),
@@ -489,7 +591,7 @@ fn abort_merge(repo_path: String) -> Result<String, String> {
             if e.contains("There is no merge to abort") || e.contains("MERGE_HEAD") {
                 return Ok("当前没有进行中的合并".to_string());
             }
-            let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
+            let repo = open_repo(&repo_path)?;
             let head = repo
                 .head()
                 .and_then(|h| h.peel_to_commit())
@@ -503,40 +605,26 @@ fn abort_merge(repo_path: String) -> Result<String, String> {
 
 #[tauri::command]
 fn get_conflicts(repo_path: String) -> Result<Vec<ConflictInfo>, String> {
-    let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
-    let index = repo.index().map_err(|e| e.to_string())?;
-
-    let mut conflicts: Vec<ConflictInfo> = Vec::new();
-
-    let mut entries = index
-        .conflicts()
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
+    let repo = open_repo(&repo_path)?;
 
     let obj2bytes = |obj: &git2::IndexEntry| -> Result<String, String> {
         let blob = repo.find_blob(obj.id).map_err(|e| e.to_string())?;
         Ok(String::from_utf8_lossy(blob.content()).into_owned())
     };
 
-    let mut processed = std::collections::HashSet::new();
-    for entry in entries.drain(..) {
-        let path = match entry.our.as_ref().or(entry.their.as_ref()).or(entry.ancestor.as_ref()) {
-            Some(e) => e.path.clone(),
-            None => continue,
+    let mut conflicts: Vec<ConflictInfo> = Vec::new();
+    for (path, our, their, ancestor) in index_conflicts(&repo) {
+        let read = |entry: &Option<git2::IndexEntry>| -> Result<String, String> {
+            match entry {
+                Some(obj) => obj2bytes(obj),
+                None => Ok(String::new()),
+            }
         };
-        let path_str = String::from_utf8_lossy(&path).into_owned();
-        if !processed.insert(path.clone()) {
-            continue;
-        }
-        let ours = entry.our.as_ref().map(obj2bytes).unwrap_or_else(|| Ok(String::new()))?;
-        let theirs = entry.their.as_ref().map(obj2bytes).unwrap_or_else(|| Ok(String::new()))?;
-        let base = entry.ancestor.as_ref().map(obj2bytes).unwrap_or_else(|| Ok(String::new()))?;
         conflicts.push(ConflictInfo {
-            path: path_str,
-            ours,
-            theirs,
-            base,
+            path: String::from_utf8_lossy(&path).into_owned(),
+            ours: read(&our)?,
+            theirs: read(&their)?,
+            base: read(&ancestor)?,
         });
     }
 
@@ -549,63 +637,18 @@ struct FileContent {
     path: String,
     /// Content from the working tree, or empty if the file does not exist there.
     working: String,
-    /// Content from HEAD, or empty if absent.
-    head: String,
-    /// Content from the index (staged), or empty if absent.
-    staged: String,
-    /// True if the file has an entry in the index (i.e. tracked).
-    tracked: bool,
     /// True if there is an active merge conflict for this path.
     conflicted: bool,
 }
 
 #[tauri::command]
 fn get_file_contents(repo_path: String, path: String) -> Result<FileContent, String> {
-    let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
-    let path_buf = Path::new(&path);
-
-    let head_tree = repo.head().and_then(|h| h.peel_to_tree()).ok();
-    let index = repo.index().map_err(|e| e.to_string())?;
-
-    let read_blob = |tree: &git2::Tree| -> String {
-        match tree.get_path(path_buf) {
-            Ok(entry) => repo
-                .find_blob(entry.id())
-                .map(|b| String::from_utf8_lossy(b.content()).into_owned())
-                .unwrap_or_default(),
-            Err(_) => String::new(),
-        }
-    };
-
-    let head_content = head_tree.as_ref().map(read_blob).unwrap_or_default();
-
-    let staged_content = match index.get_path(path_buf, 0) {
-        Some(entry) => repo
-            .find_blob(entry.id)
-            .map(|b| String::from_utf8_lossy(b.content()).into_owned())
-            .unwrap_or_default(),
-        None => String::new(),
-    };
-
-    let tracked = index.get_path(path_buf, 0).is_some()
-        || index.get_path(path_buf, 1).is_some()
-        || index.get_path(path_buf, 2).is_some();
-
-    let conflicted = index
-        .conflicts()
-        .map(|it| {
-            it.filter_map(|c| c.ok())
-                .any(|c| {
-                    c.our.as_ref().or(c.their.as_ref()).or(c.ancestor.as_ref())
-                        .map(|e| e.path == path.as_bytes().to_vec())
-                        .unwrap_or(false)
-                })
-        })
-        .unwrap_or(false);
-
-    let working_content = repo
-        .workdir()
-        .map(|w| w.join(&path))
+    let repo = open_repo(&repo_path)?;
+    let conflicted = index_conflicts(&repo)
+        .iter()
+        .any(|(p, ..)| *p == path.as_bytes().to_vec());
+    let working = resolve_in_workdir(&repo, &path)
+        .ok()
         .filter(|p| p.exists())
         .and_then(|p| std::fs::read(p).ok())
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
@@ -613,10 +656,7 @@ fn get_file_contents(repo_path: String, path: String) -> Result<FileContent, Str
 
     Ok(FileContent {
         path,
-        working: working_content,
-        head: head_content,
-        staged: staged_content,
-        tracked,
+        working,
         conflicted,
     })
 }
@@ -625,18 +665,17 @@ fn get_file_contents(repo_path: String, path: String) -> Result<FileContent, Str
 /// Used to save a manually-edited conflict resolution.
 #[tauri::command]
 fn write_file(repo_path: String, path: String, content: String) -> Result<(), String> {
-    let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
-    let abs = repo
-        .workdir()
-        .map(|w| w.join(&path))
-        .ok_or_else(|| "repository has no workdir".to_string())?;
+    let repo = open_repo(&repo_path)?;
+    let abs = resolve_in_workdir(&repo, &path)?;
     if let Some(parent) = abs.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     std::fs::write(&abs, content).map_err(|e| e.to_string())?;
 
     let mut index = repo.index().map_err(|e| e.to_string())?;
-    index.add_path(Path::new(&path)).map_err(|e| e.to_string())?;
+    index
+        .add_path(Path::new(&path))
+        .map_err(|e| e.to_string())?;
     index.write().map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -652,7 +691,9 @@ struct Highlight {
 #[serde(rename_all = "camelCase")]
 struct DiffSegment {
     text: String,
-    /// Character ranges (byte indices) to highlight within `text`.
+    /// Character ranges (UTF-16 code units) to highlight within `text`.
+    /// The frontend slices JS strings by UTF-16 code units, so the units
+    /// must match or non-ASCII text highlights in the wrong place.
     highlights: Vec<Highlight>,
 }
 
@@ -674,27 +715,39 @@ struct FileDiff {
     rows: Vec<DiffRow>,
 }
 
-/// Return the byte ranges of `line` that differ from `other`,
-/// i.e. the minimal inner span not shared by both.
-fn char_diff_range<'a>(line: &'a str, other: &'a str) -> Vec<(usize, usize)> {
+/// Return the ranges of `line` that differ from `other` — the minimal inner
+/// span not shared by both — as UTF-16 code-unit offsets. JS `String.slice`
+/// on the frontend indexes by UTF-16 code units, and a byte- or char-indexed
+/// range would misalign as soon as the line contains non-BMP or multi-byte
+/// characters. Comparing per char (not per byte) also guarantees a span never
+/// splits inside a multi-byte character.
+fn char_diff_range(line: &str, other: &str) -> Vec<(usize, usize)> {
+    let line_chars: Vec<char> = line.chars().collect();
+    let other_chars: Vec<char> = other.chars().collect();
     let mut common_prefix = 0usize;
-    for (a, b) in line.bytes().zip(other.bytes()) {
-        if a == b {
-            common_prefix += 1;
-        } else {
-            break;
-        }
+    while common_prefix < line_chars.len()
+        && common_prefix < other_chars.len()
+        && line_chars[common_prefix] == other_chars[common_prefix]
+    {
+        common_prefix += 1;
     }
     let mut common_suffix = 0usize;
-    for (a, b) in line.bytes().rev().zip(other.bytes().rev()) {
-        if a == b && line.len() - common_suffix > common_prefix {
-            common_suffix += 1;
-        } else {
-            break;
-        }
+    while common_suffix < line_chars.len() - common_prefix
+        && common_suffix < other_chars.len() - common_prefix
+        && line_chars[line_chars.len() - 1 - common_suffix]
+            == other_chars[other_chars.len() - 1 - common_suffix]
+    {
+        common_suffix += 1;
     }
-    let start = common_prefix;
-    let end = line.len() - common_suffix;
+    if common_prefix >= line_chars.len() - common_suffix {
+        return Vec::new();
+    }
+    // char offset -> UTF-16 code-unit offset
+    let utf16_len = |chars: &[char], up_to: usize| -> usize {
+        chars[..up_to].iter().map(|c| c.len_utf16()).sum()
+    };
+    let start = utf16_len(&line_chars, common_prefix);
+    let end = utf16_len(&line_chars, line_chars.len() - common_suffix);
     if end > start {
         vec![(start, end)]
     } else {
@@ -785,11 +838,38 @@ fn align_rows(ops: Vec<(char, String)>) -> Vec<DiffRow> {
     rows
 }
 
-fn diff_strings<'a>(base: &'a str, target: &'a str) -> Vec<(char, &'a str)> {
-    let a: Vec<&str> = base.split('\n').collect();
-    let b: Vec<&str> = target.split('\n').collect();
+fn diff_strings(base: &str, target: &str) -> Result<Vec<(char, String)>, String> {
+    let a_full: Vec<&str> = base.split('\n').collect();
+    let b_full: Vec<&str> = target.split('\n').collect();
+
+    // Trim the common prefix/suffix first so the O(n·m) DP below only covers
+    // the region that actually differs — a one-line change in a 10k-line
+    // lockfile then costs a tiny matrix instead of 10^8 cells.
+    let mut start = 0usize;
+    while start < a_full.len() && start < b_full.len() && a_full[start] == b_full[start] {
+        start += 1;
+    }
+    let mut end_a = a_full.len();
+    let mut end_b = b_full.len();
+    while end_a > start && end_b > start && a_full[end_a - 1] == b_full[end_b - 1] {
+        end_a -= 1;
+        end_b -= 1;
+    }
+    let a = &a_full[start..end_a];
+    let b = &b_full[start..end_b];
     let n = a.len();
     let m = b.len();
+
+    // The DP matrix is (n+1)×(m+1) usizes; without a budget a pair of large
+    // files allocates hundreds of MB and blocks the webview. 6M cells ≈ 48MB
+    // is the hard ceiling after prefix/suffix trimming.
+    const MAX_DP_CELLS: u64 = 6_000_000;
+    if (n as u64).saturating_mul(m as u64) > MAX_DP_CELLS {
+        return Err(format!(
+            "文件差异过大（{n} 行 × {m} 行），无法生成行级 diff，请在终端用 git diff 查看"
+        ));
+    }
+
     let mut dp = vec![vec![0usize; m + 1]; n + 1];
     for i in (0..n).rev() {
         for j in (0..m).rev() {
@@ -800,44 +880,67 @@ fn diff_strings<'a>(base: &'a str, target: &'a str) -> Vec<(char, &'a str)> {
             };
         }
     }
-    let mut out = Vec::new();
+    let mut out: Vec<(char, String)> = Vec::new();
+    // Context lines before the first difference.
+    for line in &a_full[..start] {
+        out.push((' ', (*line).to_string()));
+    }
     let (mut i, mut j) = (0, 0);
     while i < n && j < m {
         if a[i] == b[j] {
-            out.push((' ', a[i]));
+            out.push((' ', a[i].to_string()));
             i += 1;
             j += 1;
         } else if dp[i + 1][j] >= dp[i][j + 1] {
-            out.push(('-', a[i]));
+            out.push(('-', a[i].to_string()));
             i += 1;
         } else {
-            out.push(('+', b[j]));
+            out.push(('+', b[j].to_string()));
             j += 1;
         }
     }
     while i < n {
-        out.push(('-', a[i]));
+        out.push(('-', a[i].to_string()));
         i += 1;
     }
     while j < m {
-        out.push(('+', b[j]));
+        out.push(('+', b[j].to_string()));
         j += 1;
     }
-    out
+    // Context lines after the last difference.
+    for line in &a_full[end_a..] {
+        out.push((' ', (*line).to_string()));
+    }
+    Ok(out)
 }
 
 /// Produce a side-by-side diff of the working tree against HEAD for the given path.
+///
+/// Only the HEAD and working-tree contents are needed; the LCS behind
+/// `diff_strings` is O(n*m), so the whole computation runs off the main
+/// thread and a huge file cannot freeze the window while it computes.
 #[tauri::command]
-fn get_diff(repo_path: String, path: String) -> Result<FileDiff, String> {
-    let fc = get_file_contents(repo_path, path.clone())?;
-    let base = fc.head;
-    let target = fc.working;
-    let ops = diff_strings(&base, &target)
-        .into_iter()
-        .map(|(k, t)| (k, t.to_string()))
-        .collect();
-    let rows = align_rows(ops);
-    Ok(FileDiff { path, rows })
+async fn get_diff(repo_path: String, path: String) -> Result<FileDiff, String> {
+    let diff = tauri::async_runtime::spawn_blocking(move || -> Result<FileDiff, String> {
+        let repo = open_repo(&repo_path)?;
+        let head_tree = repo.head().and_then(|h| h.peel_to_tree()).ok();
+        let base = head_tree
+            .as_ref()
+            .and_then(|t| tree_blob(t, &path))
+            .map(|id| blob_to_string(&repo, id))
+            .unwrap_or_else(|| Ok(String::new()))?;
+        let target = resolve_in_workdir(&repo, &path)
+            .ok()
+            .filter(|p| p.exists())
+            .and_then(|p| std::fs::read(p).ok())
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
+        let rows = align_rows(diff_strings(&base, &target)?);
+        Ok(FileDiff { path, rows })
+    })
+    .await
+    .map_err(|e| format!("diff task failed: {e}"))?;
+    diff
 }
 
 #[derive(Serialize)]
@@ -866,7 +969,11 @@ fn commit_to_summary(repo: &git2::Repository, commit: &git2::Commit) -> CommitSu
         .unwrap_or_default();
     CommitSummary {
         id: commit.id().to_string(),
-        short_id: commit.as_object().short_id().map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default(),
+        short_id: commit
+            .as_object()
+            .short_id()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default(),
         message: commit.message().unwrap_or_default().to_string(),
         author: commit.author().name().unwrap_or_default().to_string(),
         email: commit.author().email().unwrap_or_default().to_string(),
@@ -878,10 +985,12 @@ fn commit_to_summary(repo: &git2::Repository, commit: &git2::Commit) -> CommitSu
 
 #[tauri::command]
 fn get_log(repo_path: String, limit: Option<u32>) -> Result<Vec<CommitSummary>, String> {
-    let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
+    let repo = open_repo(&repo_path)?;
     let mut revwalk = repo.revwalk().map_err(|e| e.to_string())?;
     revwalk.push_head().map_err(|e| e.to_string())?;
-    revwalk.set_sorting(git2::Sort::TIME).map_err(|e| e.to_string())?;
+    revwalk
+        .set_sorting(git2::Sort::TIME)
+        .map_err(|e| e.to_string())?;
 
     let mut out = Vec::new();
     for oid in revwalk {
@@ -922,24 +1031,29 @@ fn tree_blob(tree: &git2::Tree, path: &str) -> Option<git2::Oid> {
 /// List files changed in a single commit (diff against its first parent).
 #[tauri::command]
 fn get_commit_files(repo_path: String, commit_id: String) -> Result<Vec<CommitFile>, String> {
-    let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
-    let oid: git2::Oid = commit_id.parse().map_err(|e| format!("bad commit id: {e}"))?;
+    let repo = open_repo(&repo_path)?;
+    let oid: git2::Oid = commit_id
+        .parse()
+        .map_err(|e| format!("bad commit id: {e}"))?;
     let commit = repo.find_commit(oid).map_err(|e| e.to_string())?;
     let new_tree = commit.tree().map_err(|e| e.to_string())?;
     let old_tree = if commit.parent_count() > 0 {
-        Some(commit.parent(0).map_err(|e| e.to_string())?.tree().map_err(|e| e.to_string())?)
+        Some(
+            commit
+                .parent(0)
+                .map_err(|e| e.to_string())?
+                .tree()
+                .map_err(|e| e.to_string())?,
+        )
     } else {
         None
     };
 
     let mut diff_opts = git2::DiffOptions::new();
     let mut files = Vec::new();
-    let diff = repo.diff_tree_to_tree(
-        old_tree.as_ref(),
-        Some(&new_tree),
-        Some(&mut diff_opts),
-    )
-    .map_err(|e| e.to_string())?;
+    let diff = repo
+        .diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), Some(&mut diff_opts))
+        .map_err(|e| e.to_string())?;
 
     for delta in diff.deltas() {
         let old_path = delta
@@ -952,55 +1066,70 @@ fn get_commit_files(repo_path: String, commit_id: String) -> Result<Vec<CommitFi
             .path()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let status = match delta.status() {
-            git2::Delta::Added => "added",
-            git2::Delta::Deleted => "deleted",
-            git2::Delta::Renamed => "renamed",
-            git2::Delta::Typechange => "typechange",
-            _ => "modified",
+        let status = delta_to_status(delta.status());
+        let path = if new_path.is_empty() {
+            old_path.clone()
+        } else {
+            new_path.clone()
         };
-        let path = if new_path.is_empty() { old_path.clone() } else { new_path.clone() };
         files.push(CommitFile {
             path,
             status: status.to_string(),
-            new_path: if status == "renamed" { new_path } else { String::new() },
+            new_path: if status == "renamed" {
+                new_path
+            } else {
+                String::new()
+            },
         });
     }
     Ok(files)
 }
 
 /// Side-by-side diff of one file inside a commit (parent tree vs commit tree).
+///
+/// The LCS is O(n*m): the whole computation runs off the main thread so a
+/// huge file cannot freeze the window while it computes.
 #[tauri::command]
-fn get_commit_file_diff(
+async fn get_commit_file_diff(
     repo_path: String,
     commit_id: String,
     path: String,
 ) -> Result<FileDiff, String> {
-    let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
-    let oid: git2::Oid = commit_id.parse().map_err(|e| format!("bad commit id: {e}"))?;
-    let commit = repo.find_commit(oid).map_err(|e| e.to_string())?;
-    let new_tree = commit.tree().map_err(|e| e.to_string())?;
-    let old_tree = if commit.parent_count() > 0 {
-        Some(commit.parent(0).map_err(|e| e.to_string())?.tree().map_err(|e| e.to_string())?)
-    } else {
-        None
-    };
+    let diff = tauri::async_runtime::spawn_blocking(move || -> Result<FileDiff, String> {
+        let repo = open_repo(&repo_path)?;
+        let oid: git2::Oid = commit_id
+            .parse()
+            .map_err(|e| format!("bad commit id: {e}"))?;
+        let commit = repo.find_commit(oid).map_err(|e| e.to_string())?;
+        let new_tree = commit.tree().map_err(|e| e.to_string())?;
+        let old_tree = if commit.parent_count() > 0 {
+            Some(
+                commit
+                    .parent(0)
+                    .map_err(|e| e.to_string())?
+                    .tree()
+                    .map_err(|e| e.to_string())?,
+            )
+        } else {
+            None
+        };
 
-    let old_content = old_tree
-        .as_ref()
-        .and_then(|t| tree_blob(t, &path))
-        .map(|id| blob_to_string(&repo, id))
-        .unwrap_or_else(|| Ok(String::new()))?;
-    let new_content = tree_blob(&new_tree, &path)
-        .map(|id| blob_to_string(&repo, id))
-        .unwrap_or_else(|| Ok(String::new()))?;
+        let old_content = old_tree
+            .as_ref()
+            .and_then(|t| tree_blob(t, &path))
+            .map(|id| blob_to_string(&repo, id))
+            .unwrap_or_else(|| Ok(String::new()))?;
+        let new_content = tree_blob(&new_tree, &path)
+            .map(|id| blob_to_string(&repo, id))
+            .unwrap_or_else(|| Ok(String::new()))?;
 
-    let ops = diff_strings(&old_content, &new_content)
-        .into_iter()
-        .map(|(k, t)| (k, t.to_string()))
-        .collect();
-    let rows = align_rows(ops);
-    Ok(FileDiff { path, rows })
+        let ops = diff_strings(&old_content, &new_content)?;
+        let rows = align_rows(ops);
+        Ok(FileDiff { path, rows })
+    })
+    .await
+    .map_err(|e| format!("diff task failed: {e}"))?;
+    diff
 }
 
 #[derive(Serialize)]
@@ -1014,33 +1143,51 @@ struct BranchInfo {
 
 #[tauri::command]
 fn list_branches(repo_path: String) -> Result<Vec<BranchInfo>, String> {
-    let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
+    let repo = open_repo(&repo_path)?;
     let current = repo_head_name(&repo)?;
     let mut out = Vec::new();
-    let branches = repo.branches(Some(git2::BranchType::Local)).map_err(|e| e.to_string())?;
+    let branches = repo.branches(None).map_err(|e| e.to_string())?;
     for b in branches {
-        let (branch, _) = b.map_err(|e| e.to_string())?;
+        let (branch, btype) = b.map_err(|e| e.to_string())?;
         let name = branch.name().ok().flatten().unwrap_or("").to_string();
+        if name.is_empty() {
+            continue;
+        }
         let refname = branch.get().name().unwrap_or("").to_string();
+        let short = match btype {
+            git2::BranchType::Local => name.clone(),
+            git2::BranchType::Remote => name.clone(),
+        };
+        let is_current = btype == git2::BranchType::Local && short == current;
         out.push(BranchInfo {
-            is_current: name == current,
-            name,
+            is_current,
+            name: short,
             refname,
         });
     }
+    // Locals first, then remotes; current branch first.
+    out.sort_by(|a, b| b.is_current.cmp(&a.is_current).then(a.name.cmp(&b.name)));
     Ok(out)
 }
 
 #[tauri::command]
 fn checkout(repo_path: String, branch: String) -> Result<String, String> {
-    let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
+    let repo = open_repo(&repo_path)?;
+    // Guarding a branch switch, not just merge: switching to a branch that
+    // differs in a file you have uncommitted local changes to can still drop
+    // those changes even though checkout_tree's default options are "safe".
+    // Mirror the merge/abort path so the guard is uniform across every
+    // destructive-looking operation.
+    ensure_clean_workdir(&repo)?;
     let object = repo
         .revparse_single(&branch)
         .or_else(|_| repo.revparse_single(&format!("refs/heads/{branch}")))
         .map_err(|e| e.to_string())?;
-    repo.checkout_tree(&object, None).map_err(|e| e.to_string())?;
+    repo.checkout_tree(&object, None)
+        .map_err(|e| e.to_string())?;
     if !branch.starts_with("refs/") {
-        repo.set_head(&format!("refs/heads/{branch}")).map_err(|e| e.to_string())?;
+        repo.set_head(&format!("refs/heads/{branch}"))
+            .map_err(|e| e.to_string())?;
     } else {
         repo.set_head(&branch).map_err(|e| e.to_string())?;
     }
@@ -1049,22 +1196,28 @@ fn checkout(repo_path: String, branch: String) -> Result<String, String> {
 
 #[tauri::command]
 fn create_branch(repo_path: String, name: String, from: Option<String>) -> Result<String, String> {
-    let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
+    let repo = open_repo(&repo_path)?;
     let commit = match from {
         Some(f) => {
             let obj = repo.revparse_single(&f).map_err(|e| e.to_string())?;
             obj.peel_to_commit().map_err(|e| e.to_string())?
         }
-        None => repo.head().and_then(|h| h.peel_to_commit()).map_err(|e| e.to_string())?,
+        None => repo
+            .head()
+            .and_then(|h| h.peel_to_commit())
+            .map_err(|e| e.to_string())?,
     };
-    repo.branch(&name, &commit, false).map_err(|e| e.to_string())?;
+    repo.branch(&name, &commit, false)
+        .map_err(|e| e.to_string())?;
     Ok(format!("created branch {name}"))
 }
 
 #[tauri::command]
 fn delete_branch(repo_path: String, name: String) -> Result<String, String> {
-    let repo = git2::Repository::open(&repo_path).map_err(|e| e.to_string())?;
-    let mut branch = repo.find_branch(&name, git2::BranchType::Local).map_err(|e| e.to_string())?;
+    let repo = open_repo(&repo_path)?;
+    let mut branch = repo
+        .find_branch(&name, git2::BranchType::Local)
+        .map_err(|e| e.to_string())?;
     branch.delete().map_err(|e| e.to_string())?;
     Ok(format!("deleted branch {name}"))
 }
@@ -1100,7 +1253,11 @@ fn nonempty(v: Option<String>, default: &str) -> String {
 }
 
 #[tauri::command]
-fn push(repo_path: String, remote: Option<String>, branch: Option<String>) -> Result<String, String> {
+fn push(
+    repo_path: String,
+    remote: Option<String>,
+    branch: Option<String>,
+) -> Result<String, String> {
     let remote_name = nonempty(remote, "origin");
     let branch_name = branch
         .filter(|b| !b.trim().is_empty())
@@ -1134,7 +1291,11 @@ fn push(repo_path: String, remote: Option<String>, branch: Option<String>) -> Re
     let msg = if out.is_empty() || out.contains("Everything up-to-date") {
         format!(
             "pushed {} to {remote_name}{}",
-            if branch_name.is_empty() { "current branch" } else { &branch_name },
+            if branch_name.is_empty() {
+                "current branch"
+            } else {
+                &branch_name
+            },
             if has_upstream { "" } else { " (set upstream)" }
         )
     } else {
@@ -1151,7 +1312,11 @@ fn fetch(repo_path: String, remote: Option<String>) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn pull(repo_path: String, remote: Option<String>, branch: Option<String>) -> Result<String, String> {
+fn pull(
+    repo_path: String,
+    remote: Option<String>,
+    branch: Option<String>,
+) -> Result<String, String> {
     let remote_name = nonempty(remote, "origin");
     let branch_name = branch.filter(|b| !b.trim().is_empty());
     let mut args = vec!["pull", &remote_name];
@@ -1170,7 +1335,6 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
-            greet,
             get_conflicts,
             commit,
             push,
@@ -1196,4 +1360,101 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    // ── 路径穿越（write_file / discard / resolve_conflict / get_file_contents）──
+
+    #[test]
+    fn rel_paths_are_accepted() {
+        assert!(validate_rel_path("src/main.rs").is_ok());
+        assert!(validate_rel_path("a/b/c.txt").is_ok());
+        assert!(validate_rel_path("子目录/文件.txt").is_ok());
+    }
+
+    #[test]
+    fn traversal_and_absolute_paths_are_rejected() {
+        assert!(validate_rel_path("../secrets.txt").is_err());
+        assert!(validate_rel_path("a/../../b.txt").is_err());
+        assert!(validate_rel_path(r"C:\Windows\system32\config").is_err());
+        assert!(validate_rel_path("/etc/passwd").is_err());
+        assert!(validate_rel_path(r"\\server\share\x").is_err());
+    }
+
+    // ── diff：公共前后缀裁剪 + DP 规模上限 ──
+
+    fn ops_lines(ops: &[(char, String)]) -> String {
+        ops.iter()
+            .map(|(k, t)| format!("{k}{t}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn diff_output_matches_naive_shape() {
+        let base = "a\nb\nc";
+        let target = "a\nX\nc";
+        let ops = diff_strings(base, target).unwrap();
+        assert_eq!(ops_lines(&ops), " a\n-b\n+X\n c");
+    }
+
+    #[test]
+    fn identical_files_are_all_context() {
+        let ops = diff_strings("a\nb", "a\nb").unwrap();
+        assert_eq!(ops_lines(&ops), " a\n b");
+    }
+
+    #[test]
+    fn huge_changed_region_is_rejected_not_allocated() {
+        // 前后缀裁剪后差异中段仍超预算：必须返回错误而不是分配 O(n·m) 矩阵。
+        let big: Vec<String> = (0..4000).map(|i| format!("line-{i}")).collect();
+        let base = big.join("\n");
+        let target = big.iter().rev().cloned().collect::<Vec<_>>().join("\n");
+        let err = diff_strings(&base, &target).unwrap_err();
+        assert!(err.contains("文件差异过大"), "got: {err}");
+    }
+
+    #[test]
+    fn small_change_in_big_file_is_cheap() {
+        // 1 万行文件改 1 行：裁剪后 DP 只覆盖几行，不再触发上限。
+        let mut base: Vec<String> = (0..10_000).map(|i| format!("line-{i}")).collect();
+        let mut target = base.clone();
+        target[5_000] = "changed".into();
+        base[5_000] = "orig".into();
+        let ops = diff_strings(&base.join("\n"), &target.join("\n")).unwrap();
+        let changed: Vec<_> = ops.iter().filter(|(k, _)| *k != ' ').collect();
+        assert_eq!(changed.len(), 2);
+    }
+
+    // ── diff：行内高亮区间按 UTF-16 码元计（前端 String.slice 的单位）──
+
+    #[test]
+    fn ascii_highlights_unchanged() {
+        assert_eq!(char_diff_range("hello world", "hello there"), vec![(6, 11)]);
+        assert_eq!(char_diff_range("same", "same"), Vec::new());
+    }
+
+    #[test]
+    fn cjk_highlights_use_utf16_not_bytes() {
+        // “价格：100 元”→“价格：200 元”：差异是第 4 个字符。
+        // 字节区间是 (9,12)，UTF-16 码元区间是 (3,4) —— 前端按码元切分。
+        assert_eq!(
+            char_diff_range("价格：100 元", "价格：200 元"),
+            vec![(3, 4)]
+        );
+    }
+
+    #[test]
+    fn highlights_never_split_a_multibyte_char() {
+        // “你”与“我”字节前缀部分相同：字节级比较会把字符从中间切开。
+        assert_eq!(char_diff_range("你好", "我好"), vec![(0, 1)]);
+    }
+
+    #[test]
+    fn surrogate_pairs_count_as_two_utf16_units() {
+        // 🎉 是 1 个字符、2 个 UTF-16 码元、4 个字节；差异段必须横跨 2 个码元。
+        assert_eq!(char_diff_range("a🎉b", "a🎊b"), vec![(1, 3)]);
+    }
 }
