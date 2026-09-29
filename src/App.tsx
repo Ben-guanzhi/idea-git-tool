@@ -5,289 +5,37 @@ import {
   useMemo,
   useRef,
   useState,
-  type ReactNode,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { ConflictEditor } from "./ConflictEditor";
+import { diffRowsToJsx } from "./DiffView";
+import { FileList } from "./FileTree";
+import { LogPane } from "./LogPane";
+import { OpsPanel } from "./OpsPanel";
+import { TopBar } from "./TopBar";
+import { BranchActions } from "./BranchActions";
+import { CommitPanel } from "./CommitPanel";
+import {
+  OPS_KEY,
+  REPO_KEY,
+  type BranchInfo,
+  type BusyKey,
+  type CommitFile,
+  type CommitSummary,
+  type ConflictInfo,
+  type FileContent,
+  type FileDiff,
+  type MergeResult,
+  type OpLogEntry,
+  type StatusInfo,
+} from "./types";
+import {
+  fileViewReducer,
+  FILE_VIEW_INITIAL,
+  commitExplorerReducer,
+  COMMIT_EXPLORER_INITIAL,
+} from "./viewState";
 import "./App.css";
-
-interface ConflictInfo {
-  path: string;
-  ours: string;
-  theirs: string;
-  base: string;
-}
-
-interface FileStatus {
-  path: string;
-  status: string;
-}
-
-interface StatusInfo {
-  branch: string;
-  upstream?: string | null;
-  ahead: number;
-  behind: number;
-  staged: FileStatus[];
-  unstaged: FileStatus[];
-}
-
-interface FileContent {
-  path: string;
-  working: string;
-  conflicted: boolean;
-}
-
-interface Highlight {
-  start: number;
-  end: number;
-}
-
-interface DiffSegment {
-  text: string;
-  highlights: Highlight[];
-}
-
-interface DiffRow {
-  kind: string;
-  left: DiffSegment | null;
-  right: DiffSegment | null;
-}
-
-interface FileDiff {
-  path: string;
-  rows: DiffRow[];
-}
-
-// A working-file diff and a commit-file diff both render the same two-column
-// line list, so the row markup lives in one place and both callers (and the
-// "no diff yet" null case) share it.
-function diffRowsToJsx(diff: FileDiff | null) {
-  if (!diff) return null;
-  return diff.rows.map((row, i) => (
-    <div key={i} className={`diff-row diff-${row.kind}`}>
-      <div className="diff-cell">
-        {row.left ? <SegView seg={row.left} /> : <span>&nbsp;</span>}
-      </div>
-      <div className="diff-cell">
-        {row.right ? <SegView seg={row.right} /> : <span>&nbsp;</span>}
-      </div>
-    </div>
-  ));
-}
-
-interface CommitSummary {
-  id: string;
-  shortId: string;
-  message: string;
-  author: string;
-  email: string;
-  time: string;
-  parents: string[];
-  refs: string[];
-}
-
-interface BranchInfo {
-  name: string;
-  isCurrent: boolean;
-  refname: string;
-}
-
-interface MergeResult {
-  status: string;
-  message: string;
-  conflicts: string[];
-}
-
-interface CommitFile {
-  path: string;
-  status: string;
-  newPath: string;
-}
-
-const STATUS_ICON: Record<string, string> = {
-  modified: "🖊",
-  added: "+",
-  deleted: "×",
-  renamed: "→",
-  conflicted: "⚠",
-};
-
-const REPO_KEY = "idea-git-tool:repoPath";
-const OPS_KEY = "idea-git-tool:opsPanelOpen";
-
-type BusyKey =
-  | "commit"
-  | "push"
-  | "pull"
-  | "fetch"
-  | "merge"
-  | "abort"
-  | "stage"
-  | "unstage"
-  | "discard"
-  | "checkout"
-  | "branch"
-  | "resolve"
-  | null;
-
-interface OpLogEntry {
-  id: number;
-  time: string;
-  op: string;
-  status: "ok" | "error" | "info";
-  detail: string;
-}
-
-interface TreeNode {
-  name: string;
-  path: string;
-  dir: boolean;
-  status?: string;
-  children?: TreeNode[];
-}
-
-function buildTree(files: FileStatus[]): TreeNode[] {
-  const root: TreeNode = { name: "", path: "", dir: true, children: [] };
-  for (const f of files) {
-    const parts = f.path.split(/[\\/]/);
-    let node = root;
-    for (let i = 0; i < parts.length; i++) {
-      const name = parts[i];
-      const isLeaf = i === parts.length - 1;
-      const path = parts.slice(0, i + 1).join("/");
-      if (!node.children) node.children = [];
-      let child = node.children.find(
-        (c) => c.name === name && c.dir === !isLeaf
-      );
-      if (!child) {
-        child = isLeaf
-          ? { name, path, dir: false, status: f.status }
-          : { name, path, dir: true, children: [] };
-        node.children.push(child);
-      } else if (isLeaf) {
-        child.status = f.status;
-      }
-      node = child;
-    }
-  }
-  const sortRec = (nodes: TreeNode[]) => {
-    nodes.sort((a, b) => {
-      if (a.dir !== b.dir) return a.dir ? -1 : 1;
-      return a.name.localeCompare(b.name);
-    });
-    nodes.forEach((n) => n.children && sortRec(n.children));
-  };
-  if (root.children) sortRec(root.children);
-  return root.children ?? [];
-}
-
-function collectLeafPaths(nodes: TreeNode[], out: string[] = []): string[] {
-  for (const n of nodes) {
-    if (n.dir) collectLeafPaths(n.children ?? [], out);
-    else out.push(n.path);
-  }
-  return out;
-}
-
-function checkState(
-  paths: string[],
-  checked: Set<string>
-): "on" | "off" | "partial" {
-  if (paths.length === 0) return "off";
-  let n = 0;
-  for (const p of paths) if (checked.has(p)) n++;
-  if (n === 0) return "off";
-  if (n === paths.length) return "on";
-  return "partial";
-}
-
-// ── File view state machine: what the Changes tab shows for the selected file.
-// A file selection loads content and diff as one atomic transition; the editor
-// text and the edit toggle then change independently. ──
-interface FileViewState {
-  diff: FileDiff | null;
-  editText: string;
-  editing: boolean;
-}
-
-type FileViewAction =
-  | { type: "clear" }
-  | { type: "loaded"; diff: FileDiff; working: string; conflicted: boolean }
-  | { type: "edit"; text: string }
-  | { type: "toggleEditing" };
-
-function fileViewReducer(
-  state: FileViewState,
-  action: FileViewAction
-): FileViewState {
-  switch (action.type) {
-    case "clear":
-      return { diff: null, editText: "", editing: false };
-    case "loaded":
-      return {
-        diff: action.diff,
-        editText: action.working,
-        editing: action.conflicted,
-      };
-    case "edit":
-      return { ...state, editText: action.text };
-    case "toggleEditing":
-      return { ...state, editing: !state.editing };
-  }
-}
-
-const FILE_VIEW_INITIAL: FileViewState = {
-  diff: null,
-  editText: "",
-  editing: false,
-};
-
-// ── Commit explorer state machine: the Log tab's drill-down. Selecting a
-// commit resets the file pane; files and diff arrive asynchronously, and each
-// response carries the selection it belongs to so a stale reply for an older
-// selection cannot land. ──
-interface CommitExplorerState {
-  commit: string | null;
-  files: CommitFile[];
-  file: string | null;
-  diff: FileDiff | null;
-}
-
-type CommitExplorerAction =
-  | { type: "select"; commit: string }
-  | { type: "files"; commit: string; files: CommitFile[] }
-  | { type: "selectFile"; file: string }
-  | { type: "loaded"; file: string; diff: FileDiff }
-  | { type: "loadFailed" };
-
-function commitExplorerReducer(
-  state: CommitExplorerState,
-  action: CommitExplorerAction
-): CommitExplorerState {
-  switch (action.type) {
-    case "select":
-      return { commit: action.commit, files: [], file: null, diff: null };
-    case "files":
-      return state.commit === action.commit
-        ? { ...state, files: action.files }
-        : state;
-    case "selectFile":
-      return { ...state, file: action.file, diff: null };
-    case "loaded":
-      return state.file === action.file
-        ? { ...state, diff: action.diff }
-        : state;
-    case "loadFailed":
-      return { ...state, files: [] };
-  }
-}
-
-const COMMIT_EXPLORER_INITIAL: CommitExplorerState = {
-  commit: null,
-  files: [],
-  file: null,
-  diff: null,
-};
 
 function App() {
   const [repoPath, setRepoPath] = useState(
@@ -512,6 +260,7 @@ function App() {
             diff: d,
             working: fc.working,
             conflicted: fc.conflicted,
+            isBinary: fc.isBinary,
           });
         }
       } catch (e) {
@@ -870,72 +619,20 @@ function App() {
 
   return (
     <div className="ide">
-      <header className="ide-topbar">
-        <input
-          className="repo-input"
-          placeholder="Repository path..."
-          value={repoPath}
-          onChange={(e) => setRepoPath(e.currentTarget.value)}
-        />
-        <select
-          className="branch-select"
-          value={status?.branch ?? ""}
-          onChange={(e) => doCheckout(e.currentTarget.value)}
-          title="Switch branch"
-        >
-          {branches.map((b) => (
-            <option key={b.refname} value={b.name}>
-              {b.name}
-              {b.isCurrent ? " *" : ""}
-            </option>
-          ))}
-        </select>
-        {status?.upstream && (
-          <span className="upstream">
-            {status.ahead > 0 && `↑${status.ahead} `}
-            {status.behind > 0 && `↓${status.behind} `}
-            {status.ahead === 0 && status.behind === 0 && "up to date"}
-          </span>
-        )}
-        <button
-          className="btn"
-          onClick={doFetch}
-          disabled={!!busy || !repoPath.trim()}
-          title="Fetch from remote (F5 also refreshes local status)"
-        >
-          {busy === "fetch" ? "Fetching…" : "Fetch"}
-        </button>
-        <button
-          className="btn"
-          onClick={doPull}
-          disabled={!!busy || !repoPath.trim()}
-          title="Pull from remote"
-        >
-          {busy === "pull" ? "Pulling…" : "Pull"}
-        </button>
-        <button
-          className="btn primary"
-          onClick={doPush}
-          disabled={!!busy || !repoPath.trim()}
-          title="Push to remote (sets upstream on first push)"
-        >
-          {busy === "push" ? "Pushing…" : "Push"}
-        </button>
-        <button
-          className="btn"
-          onClick={() => {
-            if (!branch.trim()) {
-              branchInputRef.current?.focus();
-            } else {
-              void doCreateBranch();
-            }
-          }}
-          disabled={!repoPath.trim()}
-          title="Create a new branch (focuses the name field if empty)"
-        >
-          New Branch
-        </button>
-      </header>
+      <TopBar
+        repoPath={repoPath}
+        onRepoPath={setRepoPath}
+        status={status}
+        branches={branches}
+        busy={busy}
+        branch={branch}
+        branchInputRef={branchInputRef}
+        onCheckout={doCheckout}
+        onFetch={doFetch}
+        onPull={doPull}
+        onPush={doPush}
+        onCreateBranch={doCreateBranch}
+      />
 
       {error && <div className="ide-error">{error}</div>}
       {info && <div className="ide-info">{info}</div>}
@@ -1030,19 +727,25 @@ function App() {
                 <div className="file-diff">
                   <div className="diff-toolbar">
                     <span className="diff-title">{selectedFile}</span>
-                    {fileView.editing && (
-                      <button className="btn" onClick={saveEdit}>
-                        Save
-                      </button>
+                    {fileView.isBinary ? (
+                      <span className="muted">Binary file — editing disabled</span>
+                    ) : (
+                      <>
+                        {fileView.editing && (
+                          <button className="btn" onClick={saveEdit}>
+                            Save
+                          </button>
+                        )}
+                        <button
+                          className="btn"
+                          onClick={() => dispatchFileView({ type: "toggleEditing" })}
+                        >
+                          {fileView.editing ? "Done editing" : "Edit"}
+                        </button>
+                      </>
                     )}
-                    <button
-                      className="btn"
-                      onClick={() => dispatchFileView({ type: "toggleEditing" })}
-                    >
-                      {fileView.editing ? "Done editing" : "Edit"}
-                    </button>
                   </div>
-                  {fileView.editing ? (
+                  {fileView.editing && !fileView.isBinary ? (
                     <textarea
                       className="edit-area"
                       value={fileView.editText}
@@ -1063,616 +766,64 @@ function App() {
             </div>
             </div>
 
-            <div className="commit-panel">
-              <textarea
-                className="commit-msg"
-                placeholder="Commit message (first line = subject, rest = body)…  Ctrl+Enter to commit"
-                value={message}
-                onChange={(e) => setMessage(e.currentTarget.value)}
-              />
-              <div className="commit-side">
-                <button
-                  className="commit-btn"
-                  onClick={doCommit}
-                  disabled={!canCommit}
-                  title={
-                    stagedCount > 0
-                      ? `Commit ${stagedCount} staged file(s)`
-                      : unstagedCount > 0
-                        ? `Stage & commit ${unstagedCount} file(s)`
-                        : "Nothing to commit"
-                  }
-                >
-                  {busy === "commit"
-                    ? "Committing…"
-                    : stagedCount > 0
-                      ? `Commit (${stagedCount})`
-                      : unstagedCount > 0
-                        ? `Stage & Commit (${unstagedCount})`
-                        : "Commit"}
-                </button>
-                <span className="commit-hint muted">
-                  {hasChanges
-                    ? `${stagedCount} staged · ${unstagedCount} unstaged`
-                    : "Working tree clean"}
-                </span>
-              </div>
-            </div>
+            <CommitPanel
+              message={message}
+              onMessage={setMessage}
+              busy={busy}
+              canCommit={canCommit}
+              stagedCount={stagedCount}
+              unstagedCount={unstagedCount}
+              hasChanges={hasChanges}
+              onCommit={doCommit}
+            />
           </div>
         )}
 
         {tab === "log" && (
-          <div className="log-pane">
-            <div className="log-body">
-              <div className="log-list">
-                {logs.map((c) => (
-                  <div
-                    key={c.id}
-                    className={
-                      explorer.commit === c.id
-                        ? "log-item selected"
-                        : "log-item"
-                    }
-                    onClick={() => selectCommit(c.id)}
-                  >
-                    <div className="log-refs">
-                      {c.refs.map((r) => (
-                        <span key={r} className="log-ref">
-                          {r}
-                        </span>
-                      ))}
-                    </div>
-                    <div className="log-msg">{c.message.split("\n")[0]}</div>
-                    <div className="log-meta">
-                      {c.author} ·{" "}
-                      {new Date(Number(c.time) * 1000).toLocaleString()} ·{" "}
-                      {c.shortId}
-                    </div>
-                  </div>
-                ))}
-                {logs.length === 0 && (
-                  <div className="muted">No commits yet.</div>
-                )}
-              </div>
-
-              <aside className="commit-files">
-                <div className="file-group-header">
-                  <span className="file-group-title">
-                    Files ({explorer.files.length})
-                  </span>
-                </div>
-                {explorer.commit && explorer.files.length === 0 && (
-                  <div className="file-empty">No files</div>
-                )}
-                {!explorer.commit && (
-                  <div className="file-empty">Select a commit</div>
-                )}
-                {explorer.files.length > 0 && (
-                  <FileTreeView
-                    files={explorer.files.map((f) => ({
-                      path: f.path,
-                      status: f.status,
-                    }))}
-                    titleKey="log"
-                    collapsed={logCollapsed}
-                    onToggleDir={toggleLogDir}
-                    selected={explorer.file}
-                    onSelect={(p) =>
-                      explorer.commit && selectCommitFile(explorer.commit, p)
-                    }
-                  />
-                )}
-              </aside>
-
-              <div className="diff-area">
-                {explorer.file ? (
-                  <div className="file-diff">
-                    <div className="diff-toolbar">
-                      <span className="diff-title">{explorer.file}</span>
-                    </div>
-                    <div className="diff-lines">
-                      {commitDiffView ?? (
-                        <span className="muted">Loading...</span>
-                      )}
-                    </div>
-                  </div>
-                ) : (
-                  <div className="empty-pane">
-                    Select a commit to view its files.
-                  </div>
-                )}
-              </div>
-            </div>
-          </div>
+          <LogPane
+            logs={logs}
+            selectedCommit={explorer.commit}
+            files={explorer.files}
+            selectedFile={explorer.file}
+            diffView={commitDiffView}
+            collapsed={logCollapsed}
+            onToggleDir={toggleLogDir}
+            onSelectCommit={selectCommit}
+            onSelectFile={(p) => {
+              if (explorer.commit) void selectCommitFile(explorer.commit, p);
+            }}
+          />
         )}
       </main>
 
-      <div className="ops-panel">
-        <button
-          className="ops-toggle"
-          onClick={toggleOps}
-          title="Git operation log"
-        >
-          <span className={opsOpen ? "ops-caret open" : "ops-caret"}>▸</span>
-          Operations
-          {ops.length > 0 && (
-            <span className="ops-badge">
-              {ops.filter((o) => o.status === "error").length > 0 && (
-                <span className="ops-err-count">
-                  {ops.filter((o) => o.status === "error").length} err
-                </span>
-              )}
-              <span className="ops-count">{ops.length}</span>
-            </span>
-          )}
-        </button>
-        {opsOpen && (
-          <div className="ops-body">
-            <div className="ops-toolbar">
-              <span className="ops-title">Git operations ({ops.length})</span>
-              <div className="ops-toolbar-actions">
-                <button
-                  className="mini-btn bulk-btn"
-                  onClick={exportOps}
-                  disabled={ops.length === 0}
-                  title="Export operations as .log"
-                >
-                  Export
-                </button>
-                <button
-                  className="mini-btn bulk-btn"
-                  onClick={() => setOps([])}
-                  disabled={ops.length === 0}
-                >
-                  Clear
-                </button>
-              </div>
-            </div>
-            <div className="ops-list">
-              {ops.length === 0 && (
-                <div className="ops-empty muted">No operations yet.</div>
-              )}
-              {ops.map((o) => (
-                <div key={o.id} className={`ops-row ops-${o.status}`}>
-                  <span className="ops-time">{o.time}</span>
-                  <span className="ops-op">{o.op}</span>
-                  <span
-                    className={`ops-status`}
-                    title={o.status}
-                  >
-                    {o.status === "ok" ? "✓" : o.status === "error" ? "✗" : "•"}
-                  </span>
-                  <span className="ops-detail">{o.detail}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-      </div>
+      <OpsPanel
+        ops={ops}
+        open={opsOpen}
+        onToggle={toggleOps}
+        onExport={exportOps}
+        onClear={() => setOps([])}
+      />
 
-      <div className="branch-actions">
-        <span className="branch-actions-label">Merge</span>
-        <select
-          className="small-input"
-          value={mergeTarget}
-          onChange={(e) => setMergeTarget(e.currentTarget.value)}
-          onFocus={() => {
-            // Branch list can be stale after external git ops.
-            if (!busy) void refresh();
-          }}
-          title={
-            mergeCandidates.length === 0
-              ? "没有可合并的其它分支（含远程）；请先创建分支"
-              : `将所选分支合并到 ${currentBranchName || "当前分支"}`
-          }
-        >
-          <option value="">
-            {mergeCandidates.length === 0
-              ? branches.length === 0
-                ? "— 无分支列表 —"
-                : "— 仅当前分支 —"
-              : "— 选择分支 —"}
-          </option>
-          {mergeCandidates.map((b) => (
-            <option key={b.refname} value={b.name}>
-              {b.name}
-            </option>
-          ))}
-        </select>
-        <button
-          className="btn"
-          onClick={doMerge}
-          disabled={!mergeTarget || !!busy || mergeCandidates.length === 0}
-          title={
-            mergeTarget
-              ? `将 ${mergeTarget} 合并到 ${currentBranchName || "当前分支"}`
-              : mergeCandidates.length === 0
-                ? "没有可合并的其它分支"
-                : "请先选择分支"
-          }
-        >
-          {busy === "merge"
-            ? "Merging…"
-            : `Merge into ${currentBranchName || "current"}`}
-        </button>
-        {conflicts.length > 0 && (
-          <button
-            className="btn abort"
-            onClick={doAbortMerge}
-            disabled={!!busy}
-          >
-            {busy === "abort" ? "Aborting…" : `Abort merge (${conflicts.length})`}
-          </button>
-        )}
-
-        <span className="branch-actions-divider" />
-
-        <input
-          ref={branchInputRef}
-          className="small-input"
-          placeholder="new branch name"
-          value={branch}
-          onChange={(e) => setBranch(e.currentTarget.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") void doCreateBranch();
-          }}
-        />
-        <button
-          className="btn"
-          onClick={doCreateBranch}
-          disabled={!branch.trim() || !repoPath.trim()}
-        >
-          Create branch
-        </button>
-
-        <span className="branch-actions-divider" />
-
-        <input
-          className="small-input"
-          placeholder="remote"
-          value={remote}
-          onChange={(e) => setRemote(e.currentTarget.value)}
-        />
-      </div>
-    </div>
-  );
-}
-
-function FileList({
-  title,
-  files,
-  selected,
-  onSelect,
-  bulkLabel,
-  onBulk,
-  actionLabel,
-  actionIcon,
-  onAction,
-  onDiscard,
-  collapsed,
-  onToggleDir,
-  checked,
-  onToggleFile,
-  onSetDir,
-  onClearChecked,
-}: {
-  title: string;
-  files: FileStatus[];
-  selected: string | null;
-  onSelect: (p: string) => void;
-  bulkLabel: string;
-  onBulk: () => void;
-  actionLabel: string;
-  actionIcon: string;
-  onAction: (p: string) => void;
-  onDiscard?: (p: string) => void;
-  collapsed: Set<string>;
-  onToggleDir: (path: string) => void;
-  checked: Set<string>;
-  onToggleFile: (path: string) => void;
-  onSetDir: (paths: string[], on: boolean) => void;
-  onClearChecked: () => void;
-}) {
-  const tree = useMemo(() => buildTree(files), [files]);
-  const allPaths = useMemo(() => collectLeafPaths(tree), [tree]);
-  const groupChecked = useMemo(
-    () => allPaths.filter((p) => checked.has(p)),
-    [allPaths, checked]
-  );
-  const rootState = checkState(allPaths, checked);
-
-  const renderNode = (node: TreeNode, depth: number): ReactNode => {
-    if (node.dir) {
-      const dirKey = `${title}:${node.path}`;
-      const isCollapsed = collapsed.has(dirKey);
-      const leaves = collectLeafPaths([node]);
-      const st = checkState(leaves, checked);
-      const allOn = st === "on";
-      return (
-        <div key={`d:${node.path}`} className="tree-dir">
-          <div
-            className="tree-dir-row"
-            style={{ paddingLeft: 8 + depth * 12 }}
-            title={node.path}
-          >
-            <span
-              className={isCollapsed ? "tree-caret" : "tree-caret open"}
-              onClick={() => onToggleDir(dirKey)}
-            >
-              ▸
-            </span>
-            <button
-              type="button"
-              className={`cb cb-${st}`}
-              title={
-                allOn
-                  ? `Deselect all under ${node.name}`
-                  : `Select all under ${node.name}`
-              }
-              onClick={(e) => {
-                e.stopPropagation();
-                onSetDir(leaves, !allOn);
-              }}
-            >
-              {st === "on" ? "✓" : st === "partial" ? "−" : ""}
-            </button>
-            <span
-              className="tree-dir-icon"
-              onClick={() => onToggleDir(dirKey)}
-            >
-              📁
-            </span>
-            <span
-              className="tree-dir-name"
-              onClick={() => onToggleDir(dirKey)}
-            >
-              {node.name}
-            </span>
-            <span className="tree-dir-count muted">{leaves.length}</span>
-          </div>
-          {!isCollapsed &&
-            node.children?.map((c) => renderNode(c, depth + 1))}
-        </div>
-      );
-    }
-    const isOn = checked.has(node.path);
-    return (
-      <div
-        key={`f:${node.path}`}
-        className={
-          selected === node.path ? "file-item selected" : "file-item"
-        }
-        style={{ paddingLeft: 8 + depth * 12 }}
-        onClick={() => onSelect(node.path)}
-        title={node.path}
-      >
-        <button
-          type="button"
-          className={`cb cb-${isOn ? "on" : "off"}`}
-          title={isOn ? "Deselect" : "Select for bulk action"}
-          onClick={(e) => {
-            e.stopPropagation();
-            onToggleFile(node.path);
-          }}
-        >
-          {isOn ? "✓" : ""}
-        </button>
-        <span className={`file-icon status-${node.status ?? "modified"}`}>
-          {STATUS_ICON[node.status ?? "modified"] ?? "•"}
-        </span>
-        <span className="file-path">{node.name}</span>
-        {onDiscard && node.status !== "conflicted" && (
-          <button
-            className="mini-btn discard-btn"
-            onClick={(e) => {
-              e.stopPropagation();
-              onDiscard(node.path);
-            }}
-            title="Discard changes"
-          >
-            ✕
-          </button>
-        )}
-        <button
-          className="mini-btn"
-          onClick={(e) => {
-            e.stopPropagation();
-            onAction(node.path);
-          }}
-          title={actionLabel}
-        >
-          {actionIcon}
-        </button>
-      </div>
-    );
-  };
-
-  return (
-    <div className="file-group">
-      <div className="file-group-header">
-        <button
-          type="button"
-          className={`cb cb-${rootState}`}
-          title={
-            rootState === "on" ? "Deselect all" : "Select all in this group"
-          }
-          onClick={() => onSetDir(allPaths, rootState !== "on")}
-        >
-          {rootState === "on" ? "✓" : rootState === "partial" ? "−" : ""}
-        </button>
-        <span className="file-group-title">
-          {title} ({files.length})
-        </span>
-        {groupChecked.length > 0 && (
-          <button
-            className="mini-btn bulk-btn"
-            onClick={onClearChecked}
-            title="Clear selection"
-          >
-            ✕ sel
-          </button>
-        )}
-        <button
-          className="mini-btn bulk-btn"
-          onClick={onBulk}
-          disabled={files.length === 0}
-          title={bulkLabel}
-        >
-          {bulkLabel}
-        </button>
-      </div>
-      <div className="file-list tree-list">
-        {files.length === 0 && (
-          <div className="file-empty">No changes</div>
-        )}
-        {tree.map((n) => renderNode(n, 0))}
-      </div>
-    </div>
-  );
-}
-
-/** Read-only tree for Log commit files (collapse + select file). */
-function FileTreeView({
-  files,
-  titleKey,
-  collapsed,
-  onToggleDir,
-  selected,
-  onSelect,
-}: {
-  files: FileStatus[];
-  titleKey: string;
-  collapsed: Set<string>;
-  onToggleDir: (path: string) => void;
-  selected: string | null;
-  onSelect: (p: string) => void;
-}) {
-  const tree = useMemo(() => buildTree(files), [files]);
-
-  const renderNode = (node: TreeNode, depth: number): ReactNode => {
-    if (node.dir) {
-      const key = `${titleKey}:${node.path}`;
-      const isCollapsed = collapsed.has(key);
-      return (
-        <div key={`d:${node.path}`} className="tree-dir">
-          <div
-            className="tree-dir-row"
-            style={{ paddingLeft: 8 + depth * 12 }}
-            onClick={() => onToggleDir(key)}
-            title={node.path}
-          >
-            <span className={isCollapsed ? "tree-caret" : "tree-caret open"}>
-              ▸
-            </span>
-            <span className="tree-dir-icon">📁</span>
-            <span className="tree-dir-name">{node.name}</span>
-          </div>
-          {!isCollapsed &&
-            node.children?.map((c) => renderNode(c, depth + 1))}
-        </div>
-      );
-    }
-    return (
-      <div
-        key={`f:${node.path}`}
-        className={selected === node.path ? "file-item selected" : "file-item"}
-        style={{ paddingLeft: 8 + depth * 12 }}
-        onClick={() => onSelect(node.path)}
-        title={node.path}
-      >
-        <span className={`file-icon status-${node.status ?? "modified"}`}>
-          {STATUS_ICON[node.status ?? "modified"] ?? "•"}
-        </span>
-        <span className="file-path">{node.name}</span>
-      </div>
-    );
-  };
-
-  return (
-    <div className="file-list tree-list">
-      {tree.map((n) => renderNode(n, 0))}
-    </div>
-  );
-}
-
-function SegView({ seg }: { seg: DiffSegment }) {
-  const text = seg.text || "\u00A0";
-  if (seg.highlights.length === 0) {
-    return <span>{text}</span>;
-  }
-  // Backend highlight ranges are UTF-16 code-unit offsets, matching slice().
-  const parts: ReactNode[] = [];
-  let cursor = 0;
-  for (const h of seg.highlights) {
-    if (h.start > cursor) {
-      parts.push(<span key={`n${cursor}`}>{text.slice(cursor, h.start)}</span>);
-    }
-    const end = Math.max(h.end, h.start);
-    parts.push(
-      <span key={`h${h.start}`} className="hl">
-        {text.slice(h.start, end)}
-      </span>
-    );
-    cursor = Math.max(cursor, end);
-  }
-  if (cursor < text.length) {
-    parts.push(<span key={`n${cursor}`}>{text.slice(cursor)}</span>);
-  }
-  return <>{parts}</>;
-}
-
-function ConflictEditor({
-  conflict,
-  repoPath,
-  onResolve,
-  onSaved,
-  onError,
-}: {
-  conflict: ConflictInfo;
-  repoPath: string;
-  onResolve: (path: string, choice: string) => void;
-  onSaved: () => void;
-  onError: (message: string) => void;
-}) {
-  const [text, setText] = useState(conflict.ours);
-
-  useEffect(() => {
-    setText(conflict.ours);
-  }, [conflict.path, conflict.ours]);
-
-  async function markResolved() {
-    try {
-      await invoke("write_file", {
-        repoPath,
-        path: conflict.path,
-        content: text,
-      });
-      onSaved();
-    } catch (e) {
-      // Surface the write failure in the app banner instead of swallowing it.
-      onError(String(e));
-    }
-  }
-
-  return (
-    <div className="conflict-editor">
-      <div className="conflict-toolbar">
-        <span className="diff-title">{conflict.path}</span>
-        <button className="btn ours" onClick={() => onResolve(conflict.path, "ours")}>
-          Accept ours
-        </button>
-        <button className="btn theirs" onClick={() => onResolve(conflict.path, "theirs")}>
-          Accept theirs
-        </button>
-        <button className="btn" onClick={markResolved}>
-          Mark as Resolved
-        </button>
-      </div>
-      <textarea
-        className="edit-area conflict-area"
-        value={text}
-        onChange={(e) => setText(e.currentTarget.value)}
-        spellCheck={false}
+      <BranchActions
+        repoPath={repoPath}
+        busy={busy}
+        conflictsCount={conflicts.length}
+        branch={branch}
+        onBranch={setBranch}
+        branchInputRef={branchInputRef}
+        mergeTarget={mergeTarget}
+        onMergeTarget={setMergeTarget}
+        mergeCandidates={mergeCandidates}
+        branchCount={branches.length}
+        currentBranchName={currentBranchName}
+        remote={remote}
+        onRemote={setRemote}
+        onMerge={doMerge}
+        onAbortMerge={doAbortMerge}
+        onCreateBranch={doCreateBranch}
+        onRefresh={() => {
+          if (!busy) void refresh();
+        }}
       />
     </div>
   );
