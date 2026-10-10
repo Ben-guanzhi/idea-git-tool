@@ -4,14 +4,14 @@ use serde::Serialize;
 
 use crate::repo::{current_branch_name, ensure_clean_workdir, open_repo, run_git};
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MergeResult {
-    /// One of: merged, fastForward, upToDate, conflicts.
-    status: String,
-    message: String,
+    /// One of: merged, fastForward, upToDate, conflicts (rebase adds rebased).
+    pub(crate) status: String,
+    pub(crate) message: String,
     /// Paths with conflicts when status == "conflicts".
-    conflicts: Vec<String>,
+    pub(crate) conflicts: Vec<String>,
 }
 
 /// One deduplicated record per conflicted path: `(path, our, their, ancestor)`,
@@ -42,7 +42,7 @@ pub(crate) fn index_conflicts(
     out
 }
 
-fn index_conflict_paths(repo: &git2::Repository) -> Vec<String> {
+pub(crate) fn index_conflict_paths(repo: &git2::Repository) -> Vec<String> {
     index_conflicts(repo)
         .iter()
         .map(|(p, ..)| String::from_utf8_lossy(p).into_owned())
@@ -211,5 +211,119 @@ pub(crate) fn abort_merge(repo_path: String) -> Result<String, String> {
                 .map_err(|e| format!("中止合并失败: {e}"))?;
             Ok("已中止合并（hard reset）".to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempRepo {
+        path: std::path::PathBuf,
+    }
+
+    impl TempRepo {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "idea-git-tool-merge-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let repo = git2::Repository::init(&dir).unwrap();
+            {
+                let mut cfg = repo.config().unwrap();
+                cfg.set_str("user.name", "Test").unwrap();
+                cfg.set_str("user.email", "test@example.com").unwrap();
+            }
+            TempRepo { path: dir }
+        }
+
+        fn path_str(&self) -> String {
+            self.path.to_string_lossy().into_owned()
+        }
+
+        fn commit_file(&self, rel: &str, content: &str, msg: &str) -> git2::Oid {
+            let repo = open_repo(&self.path_str()).unwrap();
+            std::fs::write(self.path.join(rel), content).unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new(rel)).unwrap();
+            index.write().unwrap();
+            let tree_id = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_id).unwrap();
+            let sig = repo.signature().unwrap();
+            let parents: Vec<git2::Commit> = repo
+                .head()
+                .ok()
+                .and_then(|h| h.peel_to_commit().ok())
+                .into_iter()
+                .collect();
+            let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+            repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &parent_refs)
+                .unwrap()
+        }
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn merge_fast_forwards_when_target_is_ahead() {
+        let repo = TempRepo::new();
+        repo.commit_file("a.txt", "v1\n", "base");
+
+        // Create a branch, add a commit there, return to trunk.
+        let r = open_repo(&repo.path_str()).unwrap();
+        let base = r.head().unwrap().peel_to_commit().unwrap();
+        r.branch("feature", &base, false).unwrap();
+        r.set_head("refs/heads/feature").unwrap();
+        repo.commit_file("b.txt", "new\n", "feature work");
+
+        // Back on trunk (which lacks the feature commit).
+        r.set_head("refs/heads/master").unwrap();
+        r.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+
+        let result = merge(repo.path_str(), "feature".to_string()).unwrap();
+        assert_eq!(result.status, "fastForward");
+        assert!(result.conflicts.is_empty());
+        assert!(repo.path.join("b.txt").exists());
+    }
+
+    #[test]
+    fn merge_reports_conflicts_and_abort_cleans_them() {
+        let repo = TempRepo::new();
+        repo.commit_file("a.txt", "base\n", "base");
+        let r = open_repo(&repo.path_str()).unwrap();
+        let base = r.head().unwrap().peel_to_commit().unwrap();
+        r.branch("feature", &base, false).unwrap();
+
+        // Conflicting edits on both branches.
+        repo.commit_file("a.txt", "trunk\n", "trunk edit");
+        r.set_head("refs/heads/feature").unwrap();
+        r.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        repo.commit_file("a.txt", "feature\n", "feature edit");
+        r.set_head("refs/heads/master").unwrap();
+        r.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+
+        let result = merge(repo.path_str(), "feature".to_string()).unwrap();
+        assert_eq!(result.status, "conflicts");
+        assert!(result.conflicts.iter().any(|p| p == "a.txt"));
+        // Re-open: the cached handle above holds a stale index.
+        let fresh = open_repo(&repo.path_str()).unwrap();
+        assert!(!index_conflicts(&fresh).is_empty());
+
+        // Abort clears the conflict state.
+        let _ = abort_merge(repo.path_str()).unwrap();
+        let r2 = open_repo(&repo.path_str()).unwrap();
+        assert!(index_conflicts(&r2).is_empty());
     }
 }

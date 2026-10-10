@@ -12,6 +12,10 @@ and React 19 + TypeScript.
 - **History** — commit log with an expandable per-commit file tree and inline diffs.
 - **Branches & remotes** — create / delete / checkout branches, plus push / fetch /
   pull.
+- **Rebase & stash** — replay the current branch onto another (conflicts reuse
+  the same resolution UI, with continue / abort), plus stash save / apply /
+  pop / drop.
+- **Tags** — lightweight and annotated tags: create, list, and delete.
 - **Inline diff** — IDEA-style split diff viewer using UTF-16-safe char-level diff
   ranges, and a text editor for editing conflict files in place.
 

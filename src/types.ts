@@ -72,6 +72,18 @@ export interface MergeResult {
   conflicts: string[];
 }
 
+export interface StashInfo {
+  index: number;
+  message: string;
+}
+
+export interface TagInfo {
+  name: string;
+  target: string;
+  annotated: boolean;
+  message?: string | null;
+}
+
 export interface CommitFile {
   path: string;
   status: string;
@@ -102,6 +114,9 @@ export type BusyKey =
   | "checkout"
   | "branch"
   | "resolve"
+  | "rebase"
+  | "stash"
+  | "tag"
   | null;
 
 export interface OpLogEntry {

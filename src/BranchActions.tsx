@@ -20,6 +20,12 @@ export function BranchActions({
   onMerge,
   onAbortMerge,
   onCreateBranch,
+  rebaseTarget,
+  onRebaseTarget,
+  rebaseInProgress,
+  onRebase,
+  onRebaseContinue,
+  onRebaseAbort,
   onRefresh,
 }: {
   repoPath: string;
@@ -38,6 +44,12 @@ export function BranchActions({
   onMerge: () => void;
   onAbortMerge: () => void;
   onCreateBranch: () => void;
+  rebaseTarget: string;
+  onRebaseTarget: (value: string) => void;
+  rebaseInProgress: boolean;
+  onRebase: () => void;
+  onRebaseContinue: () => void;
+  onRebaseAbort: () => void;
   onRefresh: () => void;
 }) {
   return (
@@ -87,6 +99,69 @@ export function BranchActions({
         <button className="btn abort" onClick={onAbortMerge} disabled={!!busy}>
           {busy === "abort" ? "Aborting…" : `Abort merge (${conflictsCount})`}
         </button>
+      )}
+
+      <span className="branch-actions-divider" />
+
+      <span className="branch-actions-label">Rebase</span>
+      {rebaseInProgress ? (
+        <>
+          <button
+            className="btn"
+            onClick={onRebaseContinue}
+            disabled={!!busy}
+            title="所有冲突解决完毕后继续变基（保留原提交信息）"
+          >
+            {busy === "rebase" ? "Continuing…" : "Continue"}
+          </button>
+          <button
+            className="btn abort"
+            onClick={onRebaseAbort}
+            disabled={!!busy}
+            title="放弃变基，恢复到开始前的分支状态"
+          >
+            Abort rebase
+          </button>
+        </>
+      ) : (
+        <>
+          <select
+            className="small-input"
+            value={rebaseTarget}
+            onChange={(e) => onRebaseTarget(e.currentTarget.value)}
+            onFocus={onRefresh}
+            title={
+              mergeCandidates.length === 0
+                ? "没有可变基到的目标分支；请先创建分支"
+                : `将 ${currentBranchName || "当前分支"} 的提交重放到所选分支之上`
+            }
+          >
+            <option value="">
+              {mergeCandidates.length === 0
+                ? branchCount === 0
+                  ? "— 无分支列表 —"
+                  : "— 仅当前分支 —"
+                : "— 选择目标 —"}
+            </option>
+            {mergeCandidates.map((b) => (
+              <option key={b.refname} value={b.name}>
+                {b.name}
+              </option>
+            ))}
+          </select>
+          <button
+            className="btn"
+            onClick={onRebase}
+            disabled={!rebaseTarget || !!busy || mergeCandidates.length === 0}
+            title={
+              rebaseTarget
+                ? `将当前分支变基到 ${rebaseTarget}（当前提交重放其上）`
+                : "请先选择目标分支"
+            }
+          >
+            {busy === "rebase" ? "Rebasing…" : "Rebase onto"}
+          </button>
+        </>
       )}
 
       <span className="branch-actions-divider" />

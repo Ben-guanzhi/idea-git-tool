@@ -5,8 +5,11 @@ mod branch;
 mod diff;
 mod log;
 mod merge;
+mod rebase;
 mod remote;
 mod repo;
+mod stash;
+mod tag;
 mod working;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -35,7 +38,19 @@ pub fn run() {
             remote::fetch,
             remote::pull,
             working::discard,
-            working::write_file
+            working::write_file,
+            stash::list_stashes,
+            stash::stash_save,
+            stash::stash_apply,
+            stash::stash_pop,
+            stash::stash_drop,
+            tag::list_tags,
+            tag::create_tag,
+            tag::delete_tag,
+            rebase::rebase,
+            rebase::rebase_in_progress,
+            rebase::rebase_continue,
+            rebase::rebase_abort
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

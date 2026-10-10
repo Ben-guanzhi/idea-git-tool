@@ -56,13 +56,19 @@ fn commit_to_summary(
 }
 
 #[tauri::command]
-pub(crate) async fn get_log(repo_path: String, limit: Option<u32>) -> Result<Vec<CommitSummary>, String> {
+pub(crate) async fn get_log(
+    repo_path: String,
+    limit: Option<u32>,
+) -> Result<Vec<CommitSummary>, String> {
     tauri::async_runtime::spawn_blocking(move || get_log_impl(&repo_path, limit))
         .await
         .map_err(|e| format!("log task failed: {e}"))?
 }
 
-pub(crate) fn get_log_impl(repo_path: &str, limit: Option<u32>) -> Result<Vec<CommitSummary>, String> {
+pub(crate) fn get_log_impl(
+    repo_path: &str,
+    limit: Option<u32>,
+) -> Result<Vec<CommitSummary>, String> {
     let repo = open_repo(repo_path)?;
     let mut revwalk = repo.revwalk().map_err(|e| e.to_string())?;
     revwalk.push_head().map_err(|e| e.to_string())?;
@@ -98,7 +104,10 @@ pub(crate) struct CommitFile {
 
 /// List files changed in a single commit (diff against its first parent).
 #[tauri::command]
-pub(crate) fn get_commit_files(repo_path: String, commit_id: String) -> Result<Vec<CommitFile>, String> {
+pub(crate) fn get_commit_files(
+    repo_path: String,
+    commit_id: String,
+) -> Result<Vec<CommitFile>, String> {
     let repo = open_repo(&repo_path)?;
     let oid: git2::Oid = commit_id
         .parse()

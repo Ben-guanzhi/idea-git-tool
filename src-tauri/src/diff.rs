@@ -85,7 +85,7 @@ fn lcs_char_spans(a: &[char], b: &[char]) -> Vec<(usize, usize)> {
         let a_tok = &at[i - 1];
         for j in 1..=m {
             let b_tok = &bt[j - 1];
-            if a[ a_tok.0..a_tok.0 + a_tok.1 ] == b[b_tok.0..b_tok.0 + b_tok.1] {
+            if a[a_tok.0..a_tok.0 + a_tok.1] == b[b_tok.0..b_tok.0 + b_tok.1] {
                 cur[j] = prev[j - 1] + 1;
                 dir[i * (m + 1) + j] = 1;
             } else if prev[j] >= cur[j - 1] {
@@ -171,10 +171,13 @@ fn char_diff_range(line: &str, other: &str) -> Vec<(usize, usize)> {
     {
         vec![(common_prefix, line_end)]
     } else {
-        lcs_char_spans(&line_chars[common_prefix..line_end], &other_chars[common_prefix..other_end])
-            .into_iter()
-            .map(|(s, e)| (s + common_prefix, e + common_prefix))
-            .collect()
+        lcs_char_spans(
+            &line_chars[common_prefix..line_end],
+            &other_chars[common_prefix..other_end],
+        )
+        .into_iter()
+        .map(|(s, e)| (s + common_prefix, e + common_prefix))
+        .collect()
     };
     // char offset -> UTF-16 code-unit offset (cumulative prefix lengths)
     let mut cu: Vec<usize> = Vec::with_capacity(line_chars.len() + 1);
@@ -517,6 +520,9 @@ mod tests {
     #[test]
     fn distant_edits_highlight_separately_with_cjk_between() {
         // 中段含多字节字符时区间仍按 UTF-16 码元计。
-        assert_eq!(char_diff_range("x=1;中=2y", "x=9;中=8y"), vec![(2, 3), (6, 7)]);
+        assert_eq!(
+            char_diff_range("x=1;中=2y", "x=9;中=8y"),
+            vec![(2, 3), (6, 7)]
+        );
     }
 }

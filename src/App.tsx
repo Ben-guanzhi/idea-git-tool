@@ -14,6 +14,7 @@ import { LogPane } from "./LogPane";
 import { OpsPanel } from "./OpsPanel";
 import { TopBar } from "./TopBar";
 import { BranchActions } from "./BranchActions";
+import { StashTagBar } from "./StashTagBar";
 import { CommitPanel } from "./CommitPanel";
 import {
   OPS_KEY,
@@ -27,7 +28,9 @@ import {
   type FileDiff,
   type MergeResult,
   type OpLogEntry,
+  type StashInfo,
   type StatusInfo,
+  type TagInfo,
 } from "./types";
 import {
   fileViewReducer,
@@ -48,6 +51,15 @@ function App() {
   const [tab, setTab] = useState<"changes" | "log">("changes");
   const [branch, setBranch] = useState("");
   const [mergeTarget, setMergeTarget] = useState("");
+  const [rebaseTarget, setRebaseTarget] = useState("");
+  const [rebaseInProgress, setRebaseInProgress] = useState(false);
+  const [stashes, setStashes] = useState<StashInfo[]>([]);
+  const [tags, setTags] = useState<TagInfo[]>([]);
+  const [stashSel, setStashSel] = useState<number | null>(null);
+  const [stashMsg, setStashMsg] = useState("");
+  const [tagInput, setTagInput] = useState("");
+  const [tagMsg, setTagMsg] = useState("");
+  const [tagSel, setTagSel] = useState("");
   const [remote, setRemote] = useState("origin");
   const [info, setInfo] = useState("");
   const [error, setError] = useState("");
@@ -166,12 +178,15 @@ function App() {
   const refresh = useCallback(async () => {
     setError("");
     try {
-      // The three status queries are independent, so fetch them in parallel;
-      // they used to be awaited serially, each round-trip adding latency.
-      const [s, c, b] = await Promise.all([
+      // The queries are independent, so fetch them in parallel; they used to
+      // be awaited serially, each round-trip adding latency.
+      const [s, c, b, st, tg, rip] = await Promise.all([
         invoke<StatusInfo>("get_status", { repoPath }),
         invoke<ConflictInfo[]>("get_conflicts", { repoPath }),
         invoke<BranchInfo[]>("list_branches", { repoPath }),
+        invoke<StashInfo[]>("list_stashes", { repoPath }),
+        invoke<TagInfo[]>("list_tags", { repoPath }),
+        invoke<boolean>("rebase_in_progress", { repoPath }),
       ]);
       setStatus(s);
       // refresh is the single bookkeeper for checkbox validity: checked paths
@@ -188,6 +203,15 @@ function App() {
       });
       setConflicts(c);
       setBranches(b);
+      setStashes(st);
+      setTags(tg);
+      setRebaseInProgress(rip);
+      // The new snapshots may have invalidated the current selections
+      // (stash dropped, tag deleted by someone else): prune like checkedPaths.
+      setStashSel((prev) =>
+        prev !== null && !st.some((x) => x.index === prev) ? null : prev
+      );
+      setTagSel((prev) => (prev && !tg.some((t) => t.name === prev) ? "" : prev));
     } catch (e) {
       setError(String(e));
     }
@@ -563,6 +587,145 @@ function App() {
     });
   }
 
+  async function doRebase() {
+    setError("");
+    setInfo("");
+    const target = rebaseTarget.trim();
+    if (!target) {
+      setError("请先选择要变基的目标分支");
+      return;
+    }
+    await runOp({
+      key: "rebase",
+      op: "rebase",
+      detail: `rebase onto ${target}`,
+      onSuccess: () => setRebaseTarget(""),
+      fn: async () => {
+        const r = await invoke<MergeResult>("rebase", { repoPath, branch: target });
+        if (r.status === "conflicts") {
+          setTab("changes");
+          if (r.conflicts.length > 0) {
+            setSelectedFile(r.conflicts[0]);
+          }
+          // Conflicts mid-rebase: same business-outcome channel as merge —
+          // the Continue/Abort buttons in the footer drive the rest.
+          throw r.message;
+        }
+        return r.message;
+      },
+    });
+  }
+
+  async function doRebaseContinue() {
+    await runOp({
+      key: "rebase",
+      op: "rebase continue",
+      detail: "",
+      fn: async () => invoke<string>("rebase_continue", { repoPath }),
+    });
+  }
+
+  async function doRebaseAbort() {
+    await runOp({
+      key: "rebase",
+      op: "rebase abort",
+      detail: "",
+      onSuccess: () => setSelectedFile(null),
+      fn: async () => invoke<string>("rebase_abort", { repoPath }),
+    });
+  }
+
+  async function doStashSave() {
+    const msg = stashMsg.trim();
+    await runOp({
+      key: "stash",
+      op: "stash save",
+      detail: msg || "(default message)",
+      onSuccess: () => {
+        setStashMsg("");
+        setStashSel(0);
+      },
+      fn: async () =>
+        invoke<string>("stash_save", { repoPath, message: msg || null }),
+    });
+  }
+
+  async function doStashApply() {
+    if (stashSel === null) return;
+    const idx = stashSel;
+    await runOp({
+      key: "stash",
+      op: "stash apply",
+      detail: `stash@{${idx}}`,
+      fn: async () => invoke<string>("stash_apply", { repoPath, index: idx }),
+    });
+  }
+
+  async function doStashPop() {
+    if (stashSel === null) return;
+    const idx = stashSel;
+    await runOp({
+      key: "stash",
+      op: "stash pop",
+      detail: `stash@{${idx}}`,
+      onSuccess: () => setStashSel(null),
+      fn: async () => invoke<string>("stash_pop", { repoPath, index: idx }),
+    });
+  }
+
+  async function doStashDrop() {
+    if (stashSel === null) return;
+    const label = `stash@{${stashSel}}`;
+    if (!window.confirm(`Drop ${label}? This cannot be undone.`)) {
+      logOp("stash drop", "info", `cancelled: ${label}`);
+      return;
+    }
+    await runOp({
+      key: "stash",
+      op: "stash drop",
+      detail: label,
+      onSuccess: () => setStashSel(null),
+      fn: async () => invoke<string>("stash_drop", { repoPath, index: stashSel! }),
+    });
+  }
+
+  async function doCreateTag() {
+    const name = tagInput.trim();
+    if (!name) {
+      setError("请输入标签名称 (Tag name is required)");
+      return;
+    }
+    const msg = tagMsg.trim();
+    await runOp({
+      key: "tag",
+      op: "tag",
+      detail: `create ${name}`,
+      onSuccess: () => {
+        setTagInput("");
+        setTagMsg("");
+        setTagSel(name);
+      },
+      fn: async () =>
+        invoke<string>("create_tag", { repoPath, name, message: msg || null }),
+    });
+  }
+
+  async function doDeleteTag() {
+    const name = tagSel;
+    if (!name) return;
+    if (!window.confirm(`Delete tag "${name}"? This cannot be undone.`)) {
+      logOp("tag delete", "info", `cancelled: ${name}`);
+      return;
+    }
+    await runOp({
+      key: "tag",
+      op: "tag delete",
+      detail: `delete ${name}`,
+      onSuccess: () => setTagSel(""),
+      fn: async () => invoke<string>("delete_tag", { repoPath, name }),
+    });
+  }
+
   async function doCheckout(name: string) {
     if (!name) return;
     await runOp({
@@ -804,6 +967,32 @@ function App() {
         onClear={() => setOps([])}
       />
 
+      <StashTagBar
+        repoPath={repoPath}
+        busy={busy}
+        stashes={stashes}
+        tags={tags}
+        stashSel={stashSel}
+        onStashSel={setStashSel}
+        stashMsg={stashMsg}
+        onStashMsg={setStashMsg}
+        tagInput={tagInput}
+        onTagInput={setTagInput}
+        tagMsg={tagMsg}
+        onTagMsg={setTagMsg}
+        tagSel={tagSel}
+        onTagSel={setTagSel}
+        onSaveStash={doStashSave}
+        onApplyStash={doStashApply}
+        onPopStash={doStashPop}
+        onDropStash={doStashDrop}
+        onCreateTag={doCreateTag}
+        onDeleteTag={doDeleteTag}
+        onRefresh={() => {
+          if (!busy) void refresh();
+        }}
+      />
+
       <BranchActions
         repoPath={repoPath}
         busy={busy}
@@ -821,6 +1010,12 @@ function App() {
         onMerge={doMerge}
         onAbortMerge={doAbortMerge}
         onCreateBranch={doCreateBranch}
+        rebaseTarget={rebaseTarget}
+        onRebaseTarget={setRebaseTarget}
+        rebaseInProgress={rebaseInProgress}
+        onRebase={doRebase}
+        onRebaseContinue={doRebaseContinue}
+        onRebaseAbort={doRebaseAbort}
         onRefresh={() => {
           if (!busy) void refresh();
         }}

@@ -234,11 +234,14 @@ pub(crate) fn resolve_conflict(
 
     for p in &paths {
         let path = Path::new(p);
+        // Index stages: 1 = merge base, 2 = ours (HEAD), 3 = theirs. (This
+        // used to read stage 1 as "ours", silently resolving conflicts to the
+        // *ancestor* content.) Stage 0 fallback covers already-resolved paths.
         let ours_id = index
-            .get_path(path, 1)
+            .get_path(path, 2)
             .or_else(|| index.get_path(path, 0))
             .map(|e| e.id);
-        let theirs_id = index.get_path(path, 2).map(|e| e.id);
+        let theirs_id = index.get_path(path, 3).map(|e| e.id);
 
         let chosen_id = match choice.as_str() {
             "ours" => ours_id,
@@ -392,4 +395,185 @@ pub(crate) fn write_file(repo_path: String, path: String, content: String) -> Re
         .map_err(|e| e.to_string())?;
     index.write().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// A throwaway git repo in the OS temp dir. No `tempfile` crate in the tree,
+    /// so the directory is named from a counter plus the process id and removed
+    /// on drop; collisions across processes are avoided by the pid, within a
+    /// process by the atomic counter.
+    struct TempRepo {
+        path: PathBuf,
+    }
+
+    impl TempRepo {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let n = SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "idea-git-tool-test-{}-{}",
+                std::process::id(),
+                n
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            git2::Repository::init(&dir).unwrap();
+            TempRepo { path: dir }
+        }
+
+        fn path_str(&self) -> String {
+            self.path.to_string_lossy().into_owned()
+        }
+
+        fn write(&self, rel: &str, content: &str) {
+            let abs = self.path.join(rel);
+            if let Some(p) = abs.parent() {
+                std::fs::create_dir_all(p).unwrap();
+            }
+            std::fs::write(abs, content).unwrap();
+        }
+
+        fn read(&self, rel: &str) -> String {
+            std::fs::read_to_string(self.path.join(rel)).unwrap_or_default()
+        }
+
+        fn exists(&self, rel: &str) -> bool {
+            self.path.join(rel).exists()
+        }
+
+        fn commit_args(&self, message: &str) -> CommitArgs {
+            CommitArgs {
+                repo_path: self.path_str(),
+                message: message.to_string(),
+                author_name: "Test".to_string(),
+                author_email: "test@example.com".to_string(),
+            }
+        }
+
+        #[allow(dead_code)]
+        fn commit_all(&self, message: &str) -> String {
+            let repo = open_repo(&self.path_str()).unwrap();
+            let mut index = repo.index().unwrap();
+            index
+                .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+                .unwrap();
+            index.write().unwrap();
+            commit(self.commit_args(message)).unwrap()
+        }
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn stage_and_unstage_move_files_between_index_and_workdir() {
+        let repo = TempRepo::new();
+        repo.write("a.txt", "hello\n");
+
+        // Untracked file appears in the unstaged list as "modified" (the code's
+        // default when index_to_workdir yields no delta for a WT_NEW entry).
+        let status = get_status(repo.path_str()).unwrap();
+        assert_eq!(status.unstaged.len(), 1);
+        assert_eq!(status.unstaged[0].status, "modified");
+        assert!(status.staged.is_empty());
+
+        // Once staged against a HEAD-less index the entry is reported "added".
+        stage(repo.path_str(), vec!["a.txt".to_string()]).unwrap();
+        let status = get_status(repo.path_str()).unwrap();
+        assert!(status.unstaged.is_empty());
+        assert_eq!(status.staged.len(), 1);
+        assert_eq!(status.staged[0].status, "added");
+
+        // Unstaging returns it to the plain working-tree entry.
+        unstage(repo.path_str(), vec!["a.txt".to_string()]).unwrap();
+        let status = get_status(repo.path_str()).unwrap();
+        assert!(status.staged.is_empty());
+        assert_eq!(status.unstaged.len(), 1);
+        assert_eq!(status.unstaged[0].status, "modified");
+    }
+
+    #[test]
+    fn commit_refuses_when_nothing_is_staged() {
+        let repo = TempRepo::new();
+        repo.write("a.txt", "hi\n");
+        stage(repo.path_str(), vec!["a.txt".to_string()]).unwrap();
+        commit(repo.commit_args("first")).unwrap();
+
+        // Nothing changed since the first commit: the second must be refused
+        // rather than producing an empty commit.
+        let err = commit(repo.commit_args("second")).unwrap_err();
+        assert!(err.contains("nothing to commit"), "got: {err}");
+    }
+
+    #[test]
+    fn commit_records_staged_content() {
+        let repo = TempRepo::new();
+        repo.write("a.txt", "v1\n");
+        stage(repo.path_str(), vec!["a.txt".to_string()]).unwrap();
+        let id = commit(repo.commit_args("first")).unwrap();
+
+        let r = open_repo(&repo.path_str()).unwrap();
+        let commit = r.find_commit(git2::Oid::from_str(&id).unwrap()).unwrap();
+        let tree = commit.tree().unwrap();
+        let entry = tree.get_path(Path::new("a.txt")).unwrap();
+        let blob = r.find_blob(entry.id()).unwrap();
+        assert_eq!(blob.content(), b"v1\n");
+    }
+
+    #[test]
+    fn discard_restores_tracked_file_and_removes_untracked() {
+        let repo = TempRepo::new();
+        repo.write("tracked.txt", "original\n");
+        repo.write("untracked.txt", "temp\n");
+        stage(repo.path_str(), vec!["tracked.txt".to_string()]).unwrap();
+        // untracked.txt stays out of the index.
+        let _ = get_status(repo.path_str()).unwrap();
+        commit(repo.commit_args("base")).unwrap();
+
+        // Modify tracked, keep an untracked file around.
+        repo.write("tracked.txt", "changed\n");
+        repo.write("untracked.txt", "temp\n");
+
+        discard(
+            repo.path_str(),
+            vec!["tracked.txt".to_string(), "untracked.txt".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(repo.read("tracked.txt"), "original\n");
+        assert!(!repo.exists("untracked.txt"));
+    }
+
+    #[test]
+    fn write_file_refuses_to_clobber_binary() {
+        let repo = TempRepo::new();
+        // NUL byte makes it binary.
+        let abs = repo.path.join("bin.dat");
+        std::fs::write(&abs, [0u8, 1, 2, 3]).unwrap();
+        let err =
+            write_file(repo.path_str(), "bin.dat".to_string(), "text".to_string()).unwrap_err();
+        assert!(err.contains("二进制"), "got: {err}");
+        // The binary bytes must survive the refused write.
+        assert_eq!(std::fs::read(&abs).unwrap(), vec![0u8, 1, 2, 3]);
+    }
+
+    #[test]
+    fn write_file_rejects_path_traversal() {
+        let repo = TempRepo::new();
+        let err = write_file(
+            repo.path_str(),
+            "../escape.txt".to_string(),
+            "x".to_string(),
+        )
+        .unwrap_err();
+        assert!(err.contains("非法路径"), "got: {err}");
+    }
 }

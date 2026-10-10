@@ -180,7 +180,9 @@ mod tests {
 
     #[test]
     fn text_is_not_binary() {
-        assert!(!super::bytes_are_binary(b"hello \xe4\xbd\xa0\xe5\xa5\xbd\n"));
+        assert!(!super::bytes_are_binary(
+            b"hello \xe4\xbd\xa0\xe5\xa5\xbd\n"
+        ));
         assert!(!super::bytes_are_binary(b""));
     }
 
