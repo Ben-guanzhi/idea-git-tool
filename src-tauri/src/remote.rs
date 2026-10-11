@@ -22,16 +22,13 @@ fn push_impl(
     branch: Option<String>,
 ) -> Result<String, String> {
     let remote_name = nonempty(remote, "origin");
-    let branch_name = branch
-        .filter(|b| !b.trim().is_empty())
-        .map(|b| b)
-        .unwrap_or_else(|| {
-            // Fall back to current branch for -u detection / messaging.
-            git2::Repository::open(&repo_path)
-                .ok()
-                .and_then(|r| repo_head_name(&r).ok())
-                .unwrap_or_default()
-        });
+    let branch_name = branch.filter(|b| !b.trim().is_empty()).unwrap_or_else(|| {
+        // Fall back to current branch for -u detection / messaging.
+        git2::Repository::open(&repo_path)
+            .ok()
+            .and_then(|r| repo_head_name(&r).ok())
+            .unwrap_or_default()
+    });
 
     // Detect whether the current branch has an upstream; if not, push -u.
     let has_upstream = run_git(

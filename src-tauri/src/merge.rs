@@ -16,14 +16,14 @@ pub(crate) struct MergeResult {
 
 /// One deduplicated record per conflicted path: `(path, our, their, ancestor)`,
 /// the path taken from the first side that exists.
-pub(crate) fn index_conflicts(
-    repo: &git2::Repository,
-) -> Vec<(
+pub(crate) type ConflictRecord = (
     Vec<u8>,
     Option<git2::IndexEntry>,
     Option<git2::IndexEntry>,
     Option<git2::IndexEntry>,
-)> {
+);
+
+pub(crate) fn index_conflicts(repo: &git2::Repository) -> Vec<ConflictRecord> {
     let Ok(index) = repo.index() else {
         return Vec::new();
     };
@@ -50,7 +50,13 @@ pub(crate) fn index_conflict_paths(repo: &git2::Repository) -> Vec<String> {
 }
 
 #[tauri::command]
-pub(crate) fn merge(repo_path: String, branch: String) -> Result<MergeResult, String> {
+pub(crate) async fn merge(repo_path: String, branch: String) -> Result<MergeResult, String> {
+    tauri::async_runtime::spawn_blocking(move || merge_impl(repo_path, branch))
+        .await
+        .map_err(|e| format!("merge task failed: {e}"))?
+}
+
+fn merge_impl(repo_path: String, branch: String) -> Result<MergeResult, String> {
     let repo = open_repo(&repo_path)?;
     let current = current_branch_name(&repo)?;
 
@@ -193,7 +199,13 @@ pub(crate) fn merge(repo_path: String, branch: String) -> Result<MergeResult, St
 
 /// Abort an in-progress merge (equivalent to `git merge --abort`).
 #[tauri::command]
-pub(crate) fn abort_merge(repo_path: String) -> Result<String, String> {
+pub(crate) async fn abort_merge(repo_path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || abort_merge_impl(repo_path))
+        .await
+        .map_err(|e| format!("abort_merge task failed: {e}"))?
+}
+
+fn abort_merge_impl(repo_path: String) -> Result<String, String> {
     // Prefer system git for a full, correct abort (cleans MERGE_HEAD etc.).
     match run_git(&repo_path, &["merge", "--abort"]) {
         Ok(_) => Ok("已中止合并".to_string()),
@@ -290,7 +302,7 @@ mod tests {
         r.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
             .unwrap();
 
-        let result = merge(repo.path_str(), "feature".to_string()).unwrap();
+        let result = merge_impl(repo.path_str(), "feature".to_string()).unwrap();
         assert_eq!(result.status, "fastForward");
         assert!(result.conflicts.is_empty());
         assert!(repo.path.join("b.txt").exists());
@@ -314,7 +326,7 @@ mod tests {
         r.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
             .unwrap();
 
-        let result = merge(repo.path_str(), "feature".to_string()).unwrap();
+        let result = merge_impl(repo.path_str(), "feature".to_string()).unwrap();
         assert_eq!(result.status, "conflicts");
         assert!(result.conflicts.iter().any(|p| p == "a.txt"));
         // Re-open: the cached handle above holds a stale index.
@@ -322,7 +334,7 @@ mod tests {
         assert!(!index_conflicts(&fresh).is_empty());
 
         // Abort clears the conflict state.
-        let _ = abort_merge(repo.path_str()).unwrap();
+        let _ = abort_merge_impl(repo.path_str()).unwrap();
         let r2 = open_repo(&repo.path_str()).unwrap();
         assert!(index_conflicts(&r2).is_empty());
     }

@@ -8,17 +8,62 @@ pub(crate) fn open_repo(repo_path: &str) -> Result<git2::Repository, String> {
     git2::Repository::open(repo_path).map_err(|e| e.to_string())
 }
 
-/// Resolve a repo-relative path against the workdir, rejecting absolute paths
-/// and `..` traversal. libgit2's `index.add_path` refuses paths outside the
-/// workdir on its own, but the direct `std::fs` calls in `write_file`,
-/// `discard`, `resolve_conflict` and `get_file_contents` must not become
-/// arbitrary read/write/delete primitives: a `../` path would otherwise
-/// escape the repository entirely.
+/// Resolve a repo-relative path against the workdir, rejecting absolute paths,
+/// `..` traversal, and symlinks that point outside the repository. libgit2's
+/// `index.add_path` refuses paths outside the workdir on its own, but the
+/// direct `std::fs` calls in `write_file`, `discard`, `resolve_conflict` and
+/// `get_file_contents` must not become arbitrary read/write/delete primitives:
+/// a `../` path or a symlinked directory would otherwise escape the repository
+/// entirely.
 pub(crate) fn resolve_in_workdir(repo: &git2::Repository, path: &str) -> Result<PathBuf, String> {
     validate_rel_path(path)?;
-    repo.workdir()
-        .map(|w| w.join(path))
-        .ok_or_else(|| "repository has no workdir".to_string())
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| "repository has no workdir".to_string())?;
+    let abs = workdir.join(path);
+    let canon_work =
+        std::fs::canonicalize(workdir).map_err(|e| format!("无法解析仓库目录: {e}"))?;
+    // Resolve symlinks in the deepest existing ancestor (the target itself may
+    // not exist yet when restoring / creating a file), then re-join the rest.
+    let canon_abs =
+        canonicalize_existing(&abs).map_err(|e| format!("无法解析路径「{path}」: {e}"))?;
+    if !canon_abs.starts_with(&canon_work) {
+        return Err(format!("非法路径「{path}」：指向仓库之外"));
+    }
+    Ok(abs)
+}
+
+/// Canonicalize `path` even if its final components do not exist yet: walk up
+/// to the deepest existing ancestor, canonicalize it, then re-join the missing
+/// tail. This is what lets `write_file`/`discard` validate the *directory*
+/// symlinks before creating a brand-new file beneath them.
+fn canonicalize_existing(path: &Path) -> Result<PathBuf, std::io::Error> {
+    let mut probe = path.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match std::fs::canonicalize(&probe) {
+            Ok(canon) => {
+                let mut out = canon;
+                for part in tail.iter().rev() {
+                    out.push(part);
+                }
+                return Ok(out);
+            }
+            Err(_) => match probe.file_name() {
+                Some(name) => {
+                    tail.push(name.to_os_string());
+                    if !probe.pop() {
+                        break;
+                    }
+                }
+                None => break,
+            },
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "no existing ancestor",
+    ))
 }
 
 /// Reject absolute paths, drive prefixes and `..`/root components outright.
@@ -55,7 +100,7 @@ pub(crate) fn repo_head_name(repo: &git2::Repository) -> Result<String, String> 
     if repo.head_detached().map_err(|e| e.to_string())? {
         let oid = repo.head().map_err(|e| e.to_string())?.target();
         Ok(oid
-            .map(|o| format!("HEAD detached at {}", o.to_string()))
+            .map(|o| format!("HEAD detached at {o}"))
             .unwrap_or_else(|| "detached".to_string()))
     } else {
         match repo.head() {
@@ -127,21 +172,71 @@ pub(crate) fn bytes_are_binary(bytes: &[u8]) -> bool {
 /// Run a system `git` subcommand in `repo_path` and return trimmed stdout.
 /// Network operations (push/fetch/pull) use the system git client because
 /// libssh2 on Windows cannot load OpenSSH-format ed25519 keys (git2-rs #659).
+/// A hard timeout bounds a hung remote: `.output()` would otherwise block the
+/// calling thread (and, for a synchronous command, the main thread) forever.
 pub(crate) fn run_git(repo_path: &str, args: &[&str]) -> Result<String, String> {
-    let out = std::process::Command::new("git")
+    run_git_timeout(repo_path, args, GIT_COMMAND_TIMEOUT)
+}
+
+/// 10 minutes: generous for slow push/fetch of large repos, but still a bound
+/// so a connection that never makes progress cannot wedge the UI indefinitely.
+const GIT_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn run_git_timeout(
+    repo_path: &str,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    use std::io::Read;
+    use std::time::Instant;
+
+    let mut child = std::process::Command::new("git")
         .args(args)
         .current_dir(repo_path)
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .output()
+        .spawn()
         .map_err(|e| format!("failed to spawn git: {e}"))?;
-    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    if !out.status.success() {
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child
+            .try_wait()
+            .map_err(|e| format!("failed to wait git: {e}"))?
+        {
+            Some(s) => break s,
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "git {:?} 执行超时（{}s，已终止），请检查远端是否可达",
+                        args,
+                        timeout.as_secs()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    };
+
+    // The child has exited; drain the pipes to EOF (the write ends are closed).
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let Some(mut s) = child.stdout.take() {
+        let _ = s.read_to_end(&mut stdout);
+    }
+    if let Some(mut e) = child.stderr.take() {
+        let _ = e.read_to_end(&mut stderr);
+    }
+
+    let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+    if !status.success() {
         let msg = if !stderr.is_empty() { stderr } else { stdout };
         return Err(if msg.is_empty() {
-            format!("git {:?} failed with {}", args, out.status)
+            format!("git {:?} failed with {}", args, status)
         } else {
             msg
         });
@@ -156,7 +251,20 @@ pub(crate) fn nonempty(v: Option<String>, default: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_rel_path;
+    use super::{resolve_in_workdir, validate_rel_path};
+
+    /// Create a directory symlink cross-platform (used only in the test below;
+    /// the exact API differs by target).
+    fn make_dir_symlink(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(target, link)
+        }
+        #[cfg(not(windows))]
+        {
+            std::os::unix::fs::symlink(target, link)
+        }
+    }
 
     // ── 路径穿越（write_file / discard / resolve_conflict / get_file_contents）──
 
@@ -174,6 +282,48 @@ mod tests {
         assert!(validate_rel_path(r"C:\Windows\system32\config").is_err());
         assert!(validate_rel_path("/etc/passwd").is_err());
         assert!(validate_rel_path(r"\\server\share\x").is_err());
+    }
+
+    // A symlink pointing outside the workdir must not be followed: the fs
+    // primitives in write_file/discard resolve through it. (Skipped when the
+    // platform cannot create a symlink, e.g. Windows without developer mode.)
+    #[test]
+    fn symlink_escaping_the_workdir_is_rejected() {
+        let dir =
+            std::env::temp_dir().join(format!("idea-git-tool-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git2::Repository::init(&dir).unwrap();
+
+        // Outside the repo: a sibling temp dir.
+        let outside =
+            std::env::temp_dir().join(format!("idea-git-tool-outside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let link = dir.join("escape");
+        if make_dir_symlink(&outside, &link).is_err() {
+            // Platform refuses to create symlinks (no developer mode): skip.
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&outside);
+            eprintln!("skipping symlink test: cannot create symlink");
+            return;
+        }
+
+        // A path through the symlink escapes the workdir.
+        let res = resolve_in_workdir(&repo, "escape/secrets.txt");
+        assert!(res.is_err(), "symlink escape must be rejected");
+
+        // A symlink that stays inside the workdir is fine.
+        let inner_link = dir.join("inside");
+        let inner_target = dir.join("real");
+        std::fs::create_dir_all(&inner_target).unwrap();
+        make_dir_symlink(&inner_target, &inner_link).unwrap();
+        let res = resolve_in_workdir(&repo, "inside/file.txt");
+        assert!(res.is_ok(), "in-workdir symlink must be allowed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     // ── 二进制判定：文本编辑往返只在"NUL -free 且 UTF-8 合法"时保真 ──

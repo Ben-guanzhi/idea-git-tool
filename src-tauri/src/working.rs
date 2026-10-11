@@ -45,8 +45,20 @@ struct FileStatus {
     status: String,
 }
 
+// The working-area commands all touch the filesystem / git index and can take
+// tens of seconds on large repos (a full status scan, write_tree during
+// commit, checkout during discard). Synchronous commands execute on the main
+// thread and would freeze the webview, so each runs on the blocking pool via
+// spawn_blocking and only the thin wrapper is the #[tauri::command].
+
 #[tauri::command]
-pub(crate) fn get_status(repo_path: String) -> Result<StatusInfo, String> {
+pub(crate) async fn get_status(repo_path: String) -> Result<StatusInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || get_status_impl(repo_path))
+        .await
+        .map_err(|e| format!("get_status task failed: {e}"))?
+}
+
+fn get_status_impl(repo_path: String) -> Result<StatusInfo, String> {
     let repo = open_repo(&repo_path)?;
 
     let branch = repo_head_name(&repo)?;
@@ -137,13 +149,22 @@ pub(crate) fn get_status(repo_path: String) -> Result<StatusInfo, String> {
 }
 
 #[tauri::command]
-pub(crate) fn stage(repo_path: String, paths: Vec<String>) -> Result<(), String> {
+pub(crate) async fn stage(repo_path: String, paths: Vec<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || stage_impl(repo_path, paths))
+        .await
+        .map_err(|e| format!("stage task failed: {e}"))?
+}
+
+fn stage_impl(repo_path: String, paths: Vec<String>) -> Result<(), String> {
     let repo = open_repo(&repo_path)?;
     let mut index = repo.index().map_err(|e| e.to_string())?;
-    let workdir = repo.workdir().map(|w| w.to_path_buf());
     for p in &paths {
-        let abs = workdir.as_ref().map(|w| w.join(p));
-        let exists = abs.as_ref().map(|a| a.exists()).unwrap_or(false);
+        // Reject paths that would stage something outside the workdir (a
+        // symlink-relative name or a sibling path) before the disk exists
+        // check, so a repo containing a symlinked dir cannot add files from
+        // outside the repository.
+        let abs = resolve_in_workdir(&repo, p)?;
+        let exists = abs.exists();
         if exists {
             index.add_path(Path::new(p)).map_err(|e| e.to_string())?;
         } else if index.get_path(Path::new(p), 0).is_some() {
@@ -157,7 +178,13 @@ pub(crate) fn stage(repo_path: String, paths: Vec<String>) -> Result<(), String>
 
 /// Discard working-tree / index changes for paths: restore from HEAD, or delete untracked.
 #[tauri::command]
-pub(crate) fn discard(repo_path: String, paths: Vec<String>) -> Result<(), String> {
+pub(crate) async fn discard(repo_path: String, paths: Vec<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || discard_impl(repo_path, paths))
+        .await
+        .map_err(|e| format!("discard task failed: {e}"))?
+}
+
+fn discard_impl(repo_path: String, paths: Vec<String>) -> Result<(), String> {
     let repo = open_repo(&repo_path)?;
     let head_tree = repo
         .head()
@@ -199,7 +226,13 @@ pub(crate) fn discard(repo_path: String, paths: Vec<String>) -> Result<(), Strin
 }
 
 #[tauri::command]
-pub(crate) fn unstage(repo_path: String, paths: Vec<String>) -> Result<(), String> {
+pub(crate) async fn unstage(repo_path: String, paths: Vec<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || unstage_impl(repo_path, paths))
+        .await
+        .map_err(|e| format!("unstage task failed: {e}"))?
+}
+
+fn unstage_impl(repo_path: String, paths: Vec<String>) -> Result<(), String> {
     let repo = open_repo(&repo_path)?;
     let head_commit = repo.head().and_then(|h| h.peel_to_commit()).ok();
 
@@ -224,7 +257,17 @@ pub(crate) fn unstage(repo_path: String, paths: Vec<String>) -> Result<(), Strin
 /// Resolve a conflict for the given paths by choosing one side.
 /// `choice` is "ours" or "theirs".
 #[tauri::command]
-pub(crate) fn resolve_conflict(
+pub(crate) async fn resolve_conflict(
+    repo_path: String,
+    paths: Vec<String>,
+    choice: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || resolve_conflict_impl(repo_path, paths, choice))
+        .await
+        .map_err(|e| format!("resolve_conflict task failed: {e}"))?
+}
+
+pub(crate) fn resolve_conflict_impl(
     repo_path: String,
     paths: Vec<String>,
     choice: String,
@@ -271,7 +314,13 @@ pub(crate) fn resolve_conflict(
 }
 
 #[tauri::command]
-pub(crate) fn commit(args: CommitArgs) -> Result<String, String> {
+pub(crate) async fn commit(args: CommitArgs) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || commit_impl(args))
+        .await
+        .map_err(|e| format!("commit task failed: {e}"))?
+}
+
+fn commit_impl(args: CommitArgs) -> Result<String, String> {
     let repo = git2::Repository::open(&args.repo_path).map_err(|e| e.to_string())?;
     let mut index = repo.index().map_err(|e| e.to_string())?;
     let tree_id = index.write_tree().map_err(|e| e.to_string())?;
@@ -304,7 +353,13 @@ pub(crate) fn commit(args: CommitArgs) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub(crate) fn get_conflicts(repo_path: String) -> Result<Vec<ConflictInfo>, String> {
+pub(crate) async fn get_conflicts(repo_path: String) -> Result<Vec<ConflictInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || get_conflicts_impl(repo_path))
+        .await
+        .map_err(|e| format!("get_conflicts task failed: {e}"))?
+}
+
+fn get_conflicts_impl(repo_path: String) -> Result<Vec<ConflictInfo>, String> {
     let repo = open_repo(&repo_path)?;
 
     let obj2bytes = |obj: &git2::IndexEntry| -> Result<String, String> {
@@ -346,7 +401,16 @@ pub(crate) struct FileContent {
 }
 
 #[tauri::command]
-pub(crate) fn get_file_contents(repo_path: String, path: String) -> Result<FileContent, String> {
+pub(crate) async fn get_file_contents(
+    repo_path: String,
+    path: String,
+) -> Result<FileContent, String> {
+    tauri::async_runtime::spawn_blocking(move || get_file_contents_impl(repo_path, path))
+        .await
+        .map_err(|e| format!("get_file_contents task failed: {e}"))?
+}
+
+fn get_file_contents_impl(repo_path: String, path: String) -> Result<FileContent, String> {
     let repo = open_repo(&repo_path)?;
     let conflicted = index_conflicts(&repo)
         .iter()
@@ -374,7 +438,17 @@ pub(crate) fn get_file_contents(repo_path: String, path: String) -> Result<FileC
 /// Write the given content to the working-tree file at `path`, then stage it.
 /// Used to save a manually-edited conflict resolution.
 #[tauri::command]
-pub(crate) fn write_file(repo_path: String, path: String, content: String) -> Result<(), String> {
+pub(crate) async fn write_file(
+    repo_path: String,
+    path: String,
+    content: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || write_file_impl(repo_path, path, content))
+        .await
+        .map_err(|e| format!("write_file task failed: {e}"))?
+}
+
+fn write_file_impl(repo_path: String, path: String, content: String) -> Result<(), String> {
     let repo = open_repo(&repo_path)?;
     let abs = resolve_in_workdir(&repo, &path)?;
     // Refuse to overwrite a binary file with editor text: what the client
@@ -463,7 +537,7 @@ mod tests {
                 .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
                 .unwrap();
             index.write().unwrap();
-            commit(self.commit_args(message)).unwrap()
+            commit_impl(self.commit_args(message)).unwrap()
         }
     }
 
@@ -480,21 +554,21 @@ mod tests {
 
         // Untracked file appears in the unstaged list as "modified" (the code's
         // default when index_to_workdir yields no delta for a WT_NEW entry).
-        let status = get_status(repo.path_str()).unwrap();
+        let status = get_status_impl(repo.path_str()).unwrap();
         assert_eq!(status.unstaged.len(), 1);
         assert_eq!(status.unstaged[0].status, "modified");
         assert!(status.staged.is_empty());
 
         // Once staged against a HEAD-less index the entry is reported "added".
-        stage(repo.path_str(), vec!["a.txt".to_string()]).unwrap();
-        let status = get_status(repo.path_str()).unwrap();
+        stage_impl(repo.path_str(), vec!["a.txt".to_string()]).unwrap();
+        let status = get_status_impl(repo.path_str()).unwrap();
         assert!(status.unstaged.is_empty());
         assert_eq!(status.staged.len(), 1);
         assert_eq!(status.staged[0].status, "added");
 
         // Unstaging returns it to the plain working-tree entry.
-        unstage(repo.path_str(), vec!["a.txt".to_string()]).unwrap();
-        let status = get_status(repo.path_str()).unwrap();
+        unstage_impl(repo.path_str(), vec!["a.txt".to_string()]).unwrap();
+        let status = get_status_impl(repo.path_str()).unwrap();
         assert!(status.staged.is_empty());
         assert_eq!(status.unstaged.len(), 1);
         assert_eq!(status.unstaged[0].status, "modified");
@@ -504,12 +578,12 @@ mod tests {
     fn commit_refuses_when_nothing_is_staged() {
         let repo = TempRepo::new();
         repo.write("a.txt", "hi\n");
-        stage(repo.path_str(), vec!["a.txt".to_string()]).unwrap();
-        commit(repo.commit_args("first")).unwrap();
+        stage_impl(repo.path_str(), vec!["a.txt".to_string()]).unwrap();
+        commit_impl(repo.commit_args("first")).unwrap();
 
         // Nothing changed since the first commit: the second must be refused
         // rather than producing an empty commit.
-        let err = commit(repo.commit_args("second")).unwrap_err();
+        let err = commit_impl(repo.commit_args("second")).unwrap_err();
         assert!(err.contains("nothing to commit"), "got: {err}");
     }
 
@@ -517,8 +591,8 @@ mod tests {
     fn commit_records_staged_content() {
         let repo = TempRepo::new();
         repo.write("a.txt", "v1\n");
-        stage(repo.path_str(), vec!["a.txt".to_string()]).unwrap();
-        let id = commit(repo.commit_args("first")).unwrap();
+        stage_impl(repo.path_str(), vec!["a.txt".to_string()]).unwrap();
+        let id = commit_impl(repo.commit_args("first")).unwrap();
 
         let r = open_repo(&repo.path_str()).unwrap();
         let commit = r.find_commit(git2::Oid::from_str(&id).unwrap()).unwrap();
@@ -533,16 +607,16 @@ mod tests {
         let repo = TempRepo::new();
         repo.write("tracked.txt", "original\n");
         repo.write("untracked.txt", "temp\n");
-        stage(repo.path_str(), vec!["tracked.txt".to_string()]).unwrap();
+        stage_impl(repo.path_str(), vec!["tracked.txt".to_string()]).unwrap();
         // untracked.txt stays out of the index.
-        let _ = get_status(repo.path_str()).unwrap();
-        commit(repo.commit_args("base")).unwrap();
+        let _ = get_status_impl(repo.path_str()).unwrap();
+        commit_impl(repo.commit_args("base")).unwrap();
 
         // Modify tracked, keep an untracked file around.
         repo.write("tracked.txt", "changed\n");
         repo.write("untracked.txt", "temp\n");
 
-        discard(
+        discard_impl(
             repo.path_str(),
             vec!["tracked.txt".to_string(), "untracked.txt".to_string()],
         )
@@ -558,8 +632,8 @@ mod tests {
         // NUL byte makes it binary.
         let abs = repo.path.join("bin.dat");
         std::fs::write(&abs, [0u8, 1, 2, 3]).unwrap();
-        let err =
-            write_file(repo.path_str(), "bin.dat".to_string(), "text".to_string()).unwrap_err();
+        let err = write_file_impl(repo.path_str(), "bin.dat".to_string(), "text".to_string())
+            .unwrap_err();
         assert!(err.contains("二进制"), "got: {err}");
         // The binary bytes must survive the refused write.
         assert_eq!(std::fs::read(&abs).unwrap(), vec![0u8, 1, 2, 3]);
@@ -568,7 +642,7 @@ mod tests {
     #[test]
     fn write_file_rejects_path_traversal() {
         let repo = TempRepo::new();
-        let err = write_file(
+        let err = write_file_impl(
             repo.path_str(),
             "../escape.txt".to_string(),
             "x".to_string(),

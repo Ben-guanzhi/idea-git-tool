@@ -30,7 +30,16 @@ pub(crate) fn list_stashes(repo_path: String) -> Result<Vec<StashInfo>, String> 
 /// `git stash push -m <message>`; an empty/absent message lets libgit2
 /// generate git's own "WIP on <branch>" default.
 #[tauri::command]
-pub(crate) fn stash_save(repo_path: String, message: Option<String>) -> Result<String, String> {
+pub(crate) async fn stash_save(
+    repo_path: String,
+    message: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || stash_save_impl(repo_path, message))
+        .await
+        .map_err(|e| format!("stash_save task failed: {e}"))?
+}
+
+fn stash_save_impl(repo_path: String, message: Option<String>) -> Result<String, String> {
     let mut repo = open_repo(&repo_path)?;
     let sig = repo.signature().map_err(|e| e.to_string())?;
     let msg = message.filter(|m| !m.trim().is_empty());
@@ -46,7 +55,13 @@ pub(crate) fn stash_save(repo_path: String, message: Option<String>) -> Result<S
 
 /// `git stash apply <index>`: the stash is kept afterwards, mirroring git.
 #[tauri::command]
-pub(crate) fn stash_apply(repo_path: String, index: usize) -> Result<String, String> {
+pub(crate) async fn stash_apply(repo_path: String, index: usize) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || stash_apply_impl(repo_path, index))
+        .await
+        .map_err(|e| format!("stash_apply task failed: {e}"))?
+}
+
+fn stash_apply_impl(repo_path: String, index: usize) -> Result<String, String> {
     let mut repo = open_repo(&repo_path)?;
     repo.stash_apply(index, None).map_err(|e| e.to_string())?;
     Ok(format!("已应用 stash@{{{index}}}（条目保留）"))
@@ -55,14 +70,26 @@ pub(crate) fn stash_apply(repo_path: String, index: usize) -> Result<String, Str
 /// `git stash pop <index>`: apply, and drop only when the apply succeeded —
 /// git2 has a combined operation, so a failed apply never loses the stash.
 #[tauri::command]
-pub(crate) fn stash_pop(repo_path: String, index: usize) -> Result<String, String> {
+pub(crate) async fn stash_pop(repo_path: String, index: usize) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || stash_pop_impl(repo_path, index))
+        .await
+        .map_err(|e| format!("stash_pop task failed: {e}"))?
+}
+
+fn stash_pop_impl(repo_path: String, index: usize) -> Result<String, String> {
     let mut repo = open_repo(&repo_path)?;
     repo.stash_pop(index, None).map_err(|e| e.to_string())?;
     Ok(format!("已弹出 stash@{{{index}}}"))
 }
 
 #[tauri::command]
-pub(crate) fn stash_drop(repo_path: String, index: usize) -> Result<String, String> {
+pub(crate) async fn stash_drop(repo_path: String, index: usize) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || stash_drop_impl(repo_path, index))
+        .await
+        .map_err(|e| format!("stash_drop task failed: {e}"))?
+}
+
+fn stash_drop_impl(repo_path: String, index: usize) -> Result<String, String> {
     let mut repo = open_repo(&repo_path)?;
     repo.stash_drop(index).map_err(|e| e.to_string())?;
     Ok(format!("已丢弃 stash@{{{index}}}"))
@@ -148,7 +175,7 @@ mod tests {
 
         // save: workdir returns to HEAD, the stash appears in the list.
         std::fs::write(repo.path.join("a.txt"), "wip\n").unwrap();
-        stash_save(repo.path_str(), Some("my wip".into())).unwrap();
+        stash_save_impl(repo.path_str(), Some("my wip".into())).unwrap();
         assert_eq!(repo.read("a.txt"), "v1\n", "save must revert the workdir");
         let stashes = list_stashes(repo.path_str()).unwrap();
         assert_eq!(stashes.len(), 1);
@@ -160,22 +187,22 @@ mod tests {
         );
 
         // apply: change comes back, the stash stays (git semantics).
-        stash_apply(repo.path_str(), 0).unwrap();
+        stash_apply_impl(repo.path_str(), 0).unwrap();
         assert_eq!(repo.read("a.txt"), "wip\n");
         assert_eq!(list_stashes(repo.path_str()).unwrap().len(), 1);
         repo.reset_hard();
 
         // pop: applied and removed in one step.
-        stash_pop(repo.path_str(), 0).unwrap();
+        stash_pop_impl(repo.path_str(), 0).unwrap();
         assert_eq!(repo.read("a.txt"), "wip\n");
         assert!(list_stashes(repo.path_str()).unwrap().is_empty());
         repo.reset_hard();
 
         // drop: removes without touching the workdir.
         std::fs::write(repo.path.join("a.txt"), "gone\n").unwrap();
-        stash_save(repo.path_str(), None).unwrap();
+        stash_save_impl(repo.path_str(), None).unwrap();
         assert_eq!(list_stashes(repo.path_str()).unwrap().len(), 1);
-        stash_drop(repo.path_str(), 0).unwrap();
+        stash_drop_impl(repo.path_str(), 0).unwrap();
         assert!(list_stashes(repo.path_str()).unwrap().is_empty());
         assert_eq!(repo.read("a.txt"), "v1\n");
     }
@@ -184,7 +211,7 @@ mod tests {
     fn saving_a_clean_tree_fails_with_a_clear_message() {
         let repo = TempRepo::new();
         repo.commit_file("a.txt", "v1\n", "first");
-        let err = stash_save(repo.path_str(), None).unwrap_err();
+        let err = stash_save_impl(repo.path_str(), None).unwrap_err();
         assert!(err.contains("没有可暂存的改动"), "{err}");
     }
 
@@ -192,8 +219,8 @@ mod tests {
     fn out_of_range_indexes_are_errors() {
         let repo = TempRepo::new();
         repo.commit_file("a.txt", "v1\n", "first");
-        assert!(stash_apply(repo.path_str(), 3).is_err());
-        assert!(stash_pop(repo.path_str(), 3).is_err());
-        assert!(stash_drop(repo.path_str(), 3).is_err());
+        assert!(stash_apply_impl(repo.path_str(), 3).is_err());
+        assert!(stash_pop_impl(repo.path_str(), 3).is_err());
+        assert!(stash_drop_impl(repo.path_str(), 3).is_err());
     }
 }

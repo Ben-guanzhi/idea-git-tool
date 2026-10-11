@@ -175,8 +175,11 @@ function App() {
     });
   }
 
+  const refreshSeq = useRef(0);
+
   const refresh = useCallback(async () => {
     setError("");
+    const seq = ++refreshSeq.current;
     try {
       // The queries are independent, so fetch them in parallel; they used to
       // be awaited serially, each round-trip adding latency.
@@ -188,6 +191,10 @@ function App() {
         invoke<TagInfo[]>("list_tags", { repoPath }),
         invoke<boolean>("rebase_in_progress", { repoPath }),
       ]);
+      // A newer refresh may have started while this one was in flight (F5
+      // pressed during a mutation, repoPath changed, etc.). Only the latest
+      // snapshot may apply, or a stale one could overwrite a fresher view.
+      if (seq !== refreshSeq.current) return;
       setStatus(s);
       // refresh is the single bookkeeper for checkbox validity: checked paths
       // that no longer exist in the tree are pruned here, right where the new

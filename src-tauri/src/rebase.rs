@@ -23,7 +23,13 @@ pub(crate) fn rebase_in_progress(repo_path: String) -> Result<bool, String> {
 /// `branch`. Returns the same `MergeResult` shape as `merge` so conflicts
 /// land in the shared conflict UI.
 #[tauri::command]
-pub(crate) fn rebase(repo_path: String, branch: String) -> Result<MergeResult, String> {
+pub(crate) async fn rebase(repo_path: String, branch: String) -> Result<MergeResult, String> {
+    tauri::async_runtime::spawn_blocking(move || rebase_impl(repo_path, branch))
+        .await
+        .map_err(|e| format!("rebase task failed: {e}"))?
+}
+
+fn rebase_impl(repo_path: String, branch: String) -> Result<MergeResult, String> {
     let repo = open_repo(&repo_path)?;
     let current = repo_head_name(&repo)?;
     if branch == current {
@@ -70,7 +76,13 @@ pub(crate) fn rebase(repo_path: String, branch: String) -> Result<MergeResult, S
 /// commit message is preserved without opening an editor (`core.editor=true`
 /// keeps git's buffer as-is).
 #[tauri::command]
-pub(crate) fn rebase_continue(repo_path: String) -> Result<String, String> {
+pub(crate) async fn rebase_continue(repo_path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || rebase_continue_impl(repo_path))
+        .await
+        .map_err(|e| format!("rebase_continue task failed: {e}"))?
+}
+
+fn rebase_continue_impl(repo_path: String) -> Result<String, String> {
     match run_git(
         &repo_path,
         &["-c", "core.editor=true", "rebase", "--continue"],
@@ -98,7 +110,13 @@ pub(crate) fn rebase_continue(repo_path: String) -> Result<String, String> {
 
 /// `git rebase --abort`: restores the pre-rebase branch state.
 #[tauri::command]
-pub(crate) fn rebase_abort(repo_path: String) -> Result<String, String> {
+pub(crate) async fn rebase_abort(repo_path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || rebase_abort_impl(repo_path))
+        .await
+        .map_err(|e| format!("rebase_abort task failed: {e}"))?
+}
+
+fn rebase_abort_impl(repo_path: String) -> Result<String, String> {
     match run_git(&repo_path, &["rebase", "--abort"]) {
         Ok(_) => Ok("已中止变基".to_string()),
         Err(e) => {
@@ -114,7 +132,7 @@ pub(crate) fn rebase_abort(repo_path: String) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::working::resolve_conflict;
+    use crate::working::resolve_conflict_impl;
 
     struct TempRepo {
         path: std::path::PathBuf,
@@ -211,7 +229,7 @@ mod tests {
         repo.commit_file("f.txt", "feature\n", "feature work");
         repo.switch_branch("master");
 
-        let result = rebase(repo.path_str(), "feature".to_string()).unwrap();
+        let result = rebase_impl(repo.path_str(), "feature".to_string()).unwrap();
         assert_eq!(result.status, "rebased", "{}", result.message);
         assert!(result.conflicts.is_empty());
 
@@ -236,7 +254,7 @@ mod tests {
         // master is ahead; feature never moved — already based on the target.
         repo.commit_file("m.txt", "master\n", "master work");
 
-        let result = rebase(repo.path_str(), "feature".to_string()).unwrap();
+        let result = rebase_impl(repo.path_str(), "feature".to_string()).unwrap();
         assert_eq!(result.status, "upToDate", "{}", result.message);
         assert_eq!(repo.head_msg(), "master work");
     }
@@ -256,12 +274,12 @@ mod tests {
         repo.commit_file("a.txt", "feature\n", "feature edit");
         repo.switch_branch("master");
 
-        let result = rebase(repo.path_str(), "feature".to_string()).unwrap();
+        let result = rebase_impl(repo.path_str(), "feature".to_string()).unwrap();
         assert_eq!(result.status, "conflicts");
         assert!(result.conflicts.iter().any(|p| p == "a.txt"));
         assert!(rebase_in_progress(repo.path_str()).unwrap());
 
-        rebase_abort(repo.path_str()).unwrap();
+        rebase_abort_impl(repo.path_str()).unwrap();
         assert!(!rebase_in_progress(repo.path_str()).unwrap());
         assert_eq!(
             repo.head_msg(),
@@ -288,19 +306,19 @@ mod tests {
         repo.commit_file("a.txt", "feature\n", "feature edit");
         repo.switch_branch("master");
 
-        let result = rebase(repo.path_str(), "feature".to_string()).unwrap();
+        let result = rebase_impl(repo.path_str(), "feature".to_string()).unwrap();
         assert_eq!(result.status, "conflicts");
 
         // Resolve via the shared conflict path, then continue. Choosing
         // "theirs" (the replayed commit's content) keeps that commit non-empty;
         // choosing "ours" would make it empty and git would drop it.
-        resolve_conflict(
+        resolve_conflict_impl(
             repo.path_str(),
             vec!["a.txt".to_string()],
             "theirs".to_string(),
         )
         .unwrap();
-        rebase_continue(repo.path_str()).unwrap();
+        rebase_continue_impl(repo.path_str()).unwrap();
 
         assert!(!rebase_in_progress(repo.path_str()).unwrap());
         // The replayed commit keeps its original message (git normalizes a
@@ -320,11 +338,11 @@ mod tests {
         let base = r.head().unwrap().peel_to_commit().unwrap();
         r.branch("feature", &base, false).unwrap();
 
-        let err = rebase(repo.path_str(), "master".to_string()).unwrap_err();
+        let err = rebase_impl(repo.path_str(), "master".to_string()).unwrap_err();
         assert!(err.contains("已经是当前分支"), "{err}");
 
         std::fs::write(repo.path.join("a.txt"), "dirty\n").unwrap();
-        let err = rebase(repo.path_str(), "feature".to_string()).unwrap_err();
+        let err = rebase_impl(repo.path_str(), "feature".to_string()).unwrap_err();
         assert!(err.contains("未提交的修改"), "{err}");
     }
 }

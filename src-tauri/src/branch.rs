@@ -43,7 +43,13 @@ pub(crate) fn list_branches(repo_path: String) -> Result<Vec<BranchInfo>, String
 }
 
 #[tauri::command]
-pub(crate) fn checkout(repo_path: String, branch: String) -> Result<String, String> {
+pub(crate) async fn checkout(repo_path: String, branch: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || checkout_impl(repo_path, branch))
+        .await
+        .map_err(|e| format!("checkout task failed: {e}"))?
+}
+
+fn checkout_impl(repo_path: String, branch: String) -> Result<String, String> {
     let repo = open_repo(&repo_path)?;
     // Guarding a branch switch, not just merge: switching to a branch that
     // differs in a file you have uncommitted local changes to can still drop
@@ -174,7 +180,7 @@ mod tests {
             .iter()
             .any(|b| b.name == "master" || b.name == "main"));
 
-        checkout(repo.path_str(), "feature".to_string()).unwrap();
+        checkout_impl(repo.path_str(), "feature".to_string()).unwrap();
         let branches = list_branches(repo.path_str()).unwrap();
         let feature = branches.iter().find(|b| b.name == "feature").unwrap();
         assert!(
@@ -193,7 +199,7 @@ mod tests {
             .unwrap()
             .name
             .clone();
-        checkout(repo.path_str(), trunk).unwrap();
+        checkout_impl(repo.path_str(), trunk).unwrap();
         delete_branch(repo.path_str(), "feature".to_string()).unwrap();
         let branches = list_branches(repo.path_str()).unwrap();
         assert!(!branches.iter().any(|b| b.name == "feature"));
