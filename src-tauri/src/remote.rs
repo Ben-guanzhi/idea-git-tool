@@ -48,20 +48,27 @@ fn push_impl(
 
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let out = run_git(&repo_path, &arg_refs)?;
-    let msg = if out.is_empty() || out.contains("Everything up-to-date") {
-        format!(
-            "pushed {} to {remote_name}{}",
-            if branch_name.is_empty() {
-                "current branch"
-            } else {
-                &branch_name
-            },
-            if has_upstream { "" } else { " (set upstream)" }
-        )
-    } else {
-        out
-    };
-    Ok(msg)
+    Ok(push_summary(&out, &remote_name, &branch_name, has_upstream))
+}
+
+/// What the push button should say. git's "Everything up-to-date" note is
+/// localized, so "nothing was pushed" is detected by the one piece of its
+/// output that no translation ever touches: a ref that actually moved is
+/// always advertised as `old..new name -> name`. With no advertisement, lead
+/// with our own summary instead of dumping git's prose at the user.
+fn push_summary(out: &str, remote_name: &str, branch_name: &str, has_upstream: bool) -> String {
+    if out.lines().any(|line| line.contains(" -> ")) {
+        return out.to_string();
+    }
+    format!(
+        "pushed {} to {remote_name}{}",
+        if branch_name.is_empty() {
+            "current branch"
+        } else {
+            branch_name
+        },
+        if has_upstream { "" } else { " (set upstream)" }
+    )
 }
 
 #[tauri::command]
@@ -104,4 +111,42 @@ fn pull_impl(
         "pulled {} from {remote_name}",
         branch_name.unwrap_or_else(|| "current branch".to_string())
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::push_summary;
+
+    /// "Everything up-to-date" is what a translated git does not say, which is
+    /// why the summary is keyed off the ref advertisement instead.
+    #[test]
+    fn an_up_to_date_push_gets_the_summary_in_any_language() {
+        for note in ["Everything up-to-date", "已经是最新的", "Todo al dia", ""] {
+            let out = push_summary(note, "origin", "main", true);
+            assert_eq!(out, "pushed main to origin", "{note:?}");
+        }
+    }
+
+    #[test]
+    fn a_push_that_moves_a_ref_keeps_gits_output() {
+        let out = push_summary(
+            "To github.com:o/r.git\n   a1b2c3d..e4f5g6h main -> main",
+            "origin",
+            "main",
+            true,
+        );
+        assert!(out.contains(" -> main"), "{out}");
+    }
+
+    #[test]
+    fn the_branch_and_upstream_flags_are_preserved() {
+        assert_eq!(
+            push_summary("", "origin", "", true),
+            "pushed current branch to origin"
+        );
+        assert_eq!(
+            push_summary("", "origin", "feature", false),
+            "pushed feature to origin (set upstream)"
+        );
+    }
 }

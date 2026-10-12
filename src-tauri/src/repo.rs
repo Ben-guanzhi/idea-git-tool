@@ -8,6 +8,22 @@ pub(crate) fn open_repo(repo_path: &str) -> Result<git2::Repository, String> {
     git2::Repository::open(repo_path).map_err(|e| e.to_string())
 }
 
+/// The commit HEAD points at right now, or `None` in a repository that has no
+/// named tip yet.
+///
+/// Callers compare this id across a `git` invocation to learn whether the
+/// command moved the branch. The alternative — reading git's own verdict — is
+/// not reliable in either direction: the phrases are gettext-localized
+/// ("already up to date", "successfully rebased"), and `run_git` discards
+/// stdout when the process fails. The branch id is written by git itself and
+/// never translated.
+pub(crate) fn head_oid(repo: &git2::Repository) -> Option<git2::Oid> {
+    match repo.head() {
+        Ok(head) => head.target(),
+        Err(_) => None,
+    }
+}
+
 /// Resolve a repo-relative path against the workdir, rejecting absolute paths,
 /// `..` traversal, and symlinks that point outside the repository. libgit2's
 /// `index.add_path` refuses paths outside the workdir on its own, but the

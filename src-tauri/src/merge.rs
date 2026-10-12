@@ -210,8 +210,11 @@ fn abort_merge_impl(repo_path: String) -> Result<String, String> {
     match run_git(&repo_path, &["merge", "--abort"]) {
         Ok(_) => Ok("已中止合并".to_string()),
         Err(e) => {
-            // Fallback: hard reset to HEAD if merge --abort is unavailable.
-            if e.contains("There is no merge to abort") || e.contains("MERGE_HEAD") {
+            // git's "There is no merge to abort" is localized, and the old
+            // "MERGE_HEAD" arm only ever matched that substring inside git's
+            // own message — it never looked at the file. Both misses sent a
+            // non-merging repository down the hard reset below.
+            if !merge_in_progress(&repo_path)? {
                 return Ok("当前没有进行中的合并".to_string());
             }
             let repo = open_repo(&repo_path)?;
@@ -219,16 +222,28 @@ fn abort_merge_impl(repo_path: String) -> Result<String, String> {
                 .head()
                 .and_then(|h| h.peel_to_commit())
                 .map_err(|_| "无法中止：没有可重置的 HEAD".to_string())?;
+            // A hard reset hides the reason `git merge --abort` failed, so
+            // keep it in the message rather than dropping it.
             repo.reset(head.as_object(), git2::ResetType::Hard, None)
-                .map_err(|e| format!("中止合并失败: {e}"))?;
-            Ok("已中止合并（hard reset）".to_string())
+                .map_err(|err| format!("中止合并失败: {err}"))?;
+            Ok(format!("已中止合并（hard reset），git 报：{e}"))
         }
     }
+}
+
+/// True while a merge is in progress. `git merge` writes MERGE_HEAD when a
+/// conflict stops it and removes it on success or `--abort`, so its absence is
+/// the locale-independent answer, and it is read with `exists()` rather than
+/// inferred from a translated sentence.
+pub(crate) fn merge_in_progress(repo_path: &str) -> Result<bool, String> {
+    let repo = open_repo(repo_path)?;
+    Ok(repo.path().join("MERGE_HEAD").exists())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repo::head_oid;
 
     struct TempRepo {
         path: std::path::PathBuf,
@@ -337,5 +352,59 @@ mod tests {
         let _ = abort_merge_impl(repo.path_str()).unwrap();
         let r2 = open_repo(&repo.path_str()).unwrap();
         assert!(index_conflicts(&r2).is_empty());
+        assert!(!merge_in_progress(&repo.path_str()).unwrap());
+    }
+
+    /// `merge_in_progress` is what abort now keys off, so it has to agree with
+    /// the repository: false in a plain tree, true while a conflicted merge is
+    /// open, false once the merge finishes.
+    #[test]
+    fn merge_in_progress_tracks_the_repository() {
+        let repo = TempRepo::new();
+        repo.commit_file("a.txt", "base\n", "base");
+        assert!(!merge_in_progress(&repo.path_str()).unwrap());
+
+        let r = open_repo(&repo.path_str()).unwrap();
+        let base = r.head().unwrap().peel_to_commit().unwrap();
+        r.branch("feature", &base, false).unwrap();
+
+        repo.commit_file("a.txt", "trunk\n", "trunk edit");
+        r.set_head("refs/heads/feature").unwrap();
+        r.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        repo.commit_file("a.txt", "feature\n", "feature edit");
+        r.set_head("refs/heads/master").unwrap();
+        r.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+
+        assert!(!merge_in_progress(&repo.path_str()).unwrap());
+        let result = merge_impl(repo.path_str(), "feature".to_string()).unwrap();
+        assert_eq!(result.status, "conflicts");
+        assert!(merge_in_progress(&repo.path_str()).unwrap());
+
+        abort_merge_impl(repo.path_str()).unwrap();
+        assert!(!merge_in_progress(&repo.path_str()).unwrap());
+    }
+
+    /// Aborting when nothing is merging must not reset the working tree: that
+    /// fallback runs a hard reset, so a false "no merge" reading would have
+    /// blown away a repository that was never merging.
+    #[test]
+    fn abort_merge_with_nothing_running_does_not_reset() {
+        let repo = TempRepo::new();
+        repo.commit_file("a.txt", "v1\n", "base");
+        std::fs::write(repo.path.join("a.txt"), "dirty\n").unwrap();
+        let before = head_oid(&open_repo(&repo.path_str()).unwrap()).unwrap();
+
+        let out = abort_merge_impl(repo.path_str()).unwrap();
+        assert_eq!(out, "当前没有进行中的合并");
+
+        let after = head_oid(&open_repo(&repo.path_str()).unwrap()).unwrap();
+        assert_eq!(before, after, "a non-merging HEAD must survive");
+        assert_eq!(
+            std::fs::read_to_string(repo.path.join("a.txt")).unwrap(),
+            "dirty\n",
+            "a non-merging worktree must survive"
+        );
     }
 }

@@ -9,12 +9,21 @@
 //! same conflict UI.
 
 use crate::merge::{index_conflict_paths, MergeResult};
-use crate::repo::{ensure_clean_workdir, open_repo, repo_head_name, run_git};
+use crate::repo::{ensure_clean_workdir, head_oid, open_repo, repo_head_name, run_git};
 
 /// True while a rebase (started here or from the git CLI) is in progress.
 #[tauri::command]
 pub(crate) fn rebase_in_progress(repo_path: String) -> Result<bool, String> {
-    let repo = open_repo(&repo_path)?;
+    rebase_in_progress_impl(&repo_path)
+}
+
+/// Filesystem form of `rebase_in_progress`. Rebase state lives under
+/// `.git/rebase-merge` or `.git/rebase-apply`, so this is an O(1) reduction of
+/// "is a replay running" to two `exists()` calls, and it never depends on git's
+/// wording — which is localized. Everything that needs this inside a command
+/// uses it instead of re-parsing git's output.
+pub(crate) fn rebase_in_progress_impl(repo_path: &str) -> Result<bool, String> {
+    let repo = open_repo(repo_path)?;
     let gitdir = repo.path().to_path_buf();
     Ok(gitdir.join("rebase-merge").exists() || gitdir.join("rebase-apply").exists())
 }
@@ -39,9 +48,18 @@ fn rebase_impl(repo_path: String, branch: String) -> Result<MergeResult, String>
     // message (the same guard checkout/merge use).
     ensure_clean_workdir(&repo)?;
 
+    // Snapshot the branch before the replay: "already up to date" is the
+    // outcome that most needs a locale-independent check, because git reports
+    // it in words ("已经是最新的。" under zh) and the branch itself says
+    // nothing happened when HEAD comes back exactly where it was.
+    let head_before = head_oid(&repo);
+
     match run_git(&repo_path, &["rebase", &branch]) {
-        Ok(out) => {
-            let up_to_date = out.to_lowercase().contains("up to date");
+        Ok(_out) => {
+            // Reopen: libgit2 may still hold the refs as git found them, and
+            // the rebase just rewrote .git/HEAD and the packed refs.
+            let head_after = head_oid(&open_repo(&repo_path)?);
+            let up_to_date = head_before == head_after;
             Ok(MergeResult {
                 status: if up_to_date { "upToDate" } else { "rebased" }.into(),
                 message: if up_to_date {
@@ -88,15 +106,24 @@ fn rebase_continue_impl(repo_path: String) -> Result<String, String> {
         &["-c", "core.editor=true", "rebase", "--continue"],
     ) {
         Ok(out) => {
-            let done = out.to_lowercase().contains("success");
-            Ok(if done {
+            // git's verdict here is "Successfully rebased and updated ...",
+            // which is localized — and some success paths print nothing at
+            // all. The replay is finished exactly when .git/rebase-* is gone.
+            // If git exited 0 while a rebase still runs, it paused for another
+            // step, so hand its own text back to the UI.
+            let finished = !rebase_in_progress_impl(&repo_path).unwrap_or(true);
+            Ok(if finished {
                 "变基已完成".to_string()
             } else {
                 out
             })
         }
         Err(e) => {
-            if e.contains("No rebase in progress") || e.contains("no rebase in progress") {
+            // "No rebase in progress" is localized too, in both
+            // capitalizations. The missing .git/rebase-* directory is not, so
+            // that is what decides. When the state cannot be read, assume a
+            // replay is running and pass the error through untouched.
+            if !rebase_in_progress_impl(&repo_path).unwrap_or(true) {
                 return Err("当前没有进行中的变基".to_string());
             }
             let conflicts = index_conflict_paths(&open_repo(&repo_path)?);
@@ -120,7 +147,9 @@ fn rebase_abort_impl(repo_path: String) -> Result<String, String> {
     match run_git(&repo_path, &["rebase", "--abort"]) {
         Ok(_) => Ok("已中止变基".to_string()),
         Err(e) => {
-            if e.contains("No rebase in progress") || e.contains("no rebase in progress") {
+            // Same reduction as in `rebase_continue`: decide from
+            // .git/rebase-*, not from git's wording.
+            if !rebase_in_progress_impl(&repo_path).unwrap_or(true) {
                 Err("当前没有进行中的变基".to_string())
             } else {
                 Err(e)
@@ -344,5 +373,70 @@ mod tests {
         std::fs::write(repo.path.join("a.txt"), "dirty\n").unwrap();
         let err = rebase_impl(repo.path_str(), "feature".to_string()).unwrap_err();
         assert!(err.contains("未提交的修改"), "{err}");
+    }
+
+    /// A replay that changes nothing must be reported as up to date. git says
+    /// so in words — "already up to date" in English, 已经是最新的 under zh —
+    /// which is what this used to be a substring match on; the branch id now
+    /// decides, and it is translated by nobody.
+    #[test]
+    fn rebase_already_up_to_date_is_detected_from_the_branch() {
+        let repo = TempRepo::new();
+        repo.commit_file("a.txt", "base\n", "base");
+        let before = {
+            let r = open_repo(&repo.path_str()).unwrap();
+            let base = r.head().unwrap().peel_to_commit().unwrap();
+            r.branch("upstream", &base, false).unwrap();
+            head_oid(&r).unwrap()
+        };
+
+        let result = rebase_impl(repo.path_str(), "upstream".to_string()).unwrap();
+        assert_eq!(result.status, "upToDate", "{}", result.message);
+        assert!(result.message.contains("已是最新"), "{}", result.message);
+
+        let after = head_oid(&open_repo(&repo.path_str()).unwrap()).unwrap();
+        assert_eq!(before, after, "an up-to-date rebase must not move HEAD");
+    }
+
+    /// The mirror case: a replay that really does move the branch must not be
+    /// reported as up to date, so the id comparison is not always saying no.
+    #[test]
+    fn a_moving_rebase_is_not_reported_as_up_to_date() {
+        let repo = TempRepo::new();
+        repo.commit_file("a.txt", "base\n", "base");
+        let before = {
+            let r = open_repo(&repo.path_str()).unwrap();
+            let base = r.head().unwrap().peel_to_commit().unwrap();
+            r.branch("feature", &base, false).unwrap();
+            head_oid(&r).unwrap()
+        };
+
+        // Different files, so the replay has nothing to conflict on.
+        repo.switch_branch("feature");
+        repo.commit_file("b.txt", "feature\n", "feature edit");
+        repo.switch_branch("master");
+        repo.commit_file("a.txt", "trunk\n", "trunk edit");
+
+        let result = rebase_impl(repo.path_str(), "feature".to_string()).unwrap();
+        assert_eq!(result.status, "rebased", "{}", result.message);
+
+        let after = head_oid(&open_repo(&repo.path_str()).unwrap()).unwrap();
+        assert_ne!(before, after);
+    }
+
+    /// `--continue` and `--abort` used to recognise "No rebase in progress"
+    /// from git's wording, spelling it two ways and no other language. The
+    /// absence of .git/rebase-merge and .git/rebase-apply decides instead, and
+    /// the user still gets the friendly message rather than raw stderr.
+    #[test]
+    fn continue_and_abort_with_no_rebase_running_use_the_friendly_message() {
+        let repo = TempRepo::new();
+        repo.commit_file("a.txt", "base\n", "base");
+
+        let err = rebase_continue_impl(repo.path_str()).unwrap_err();
+        assert_eq!(err, "当前没有进行中的变基");
+
+        let err = rebase_abort_impl(repo.path_str()).unwrap_err();
+        assert_eq!(err, "当前没有进行中的变基");
     }
 }
