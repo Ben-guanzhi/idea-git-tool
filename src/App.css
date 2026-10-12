@@ -314,6 +314,19 @@ button {
   border-left: 1px solid #e0e0e0;
 }
 
+/* An elided row spans both columns: it names the run of unchanged lines the
+   backend folded away instead of pairing a left and a right cell. */
+.diff-row.diff-elided {
+  grid-template-columns: 1fr;
+  text-align: center;
+  padding: 1px 0;
+  background: #fafafa;
+  color: #999;
+  font-style: italic;
+  border-top: 1px solid #eaeaea;
+  border-bottom: 1px solid #eaeaea;
+}
+
 .diff-row.diff-added .diff-cell + .diff-cell {
   background: #e8f5e9;
 }
@@ -973,6 +986,13 @@ button {
 
   .diff-cell + .diff-cell {
     border-left-color: #444;
+  }
+
+  .diff-row.diff-elided {
+    background: #232323;
+    color: #777;
+    border-top-color: #3a3a3a;
+    border-bottom-color: #3a3a3a;
   }
 
   .diff-row.diff-added .diff-cell + .diff-cell {

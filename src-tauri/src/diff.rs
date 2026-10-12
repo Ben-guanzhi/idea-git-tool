@@ -24,7 +24,7 @@ struct DiffSegment {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DiffRow {
-    /// One of: "context", "added", "removed", "modified".
+    /// One of: "context", "added", "removed", "modified", "elided".
     kind: String,
     /// Left column (base/HEAD). None if this is an "added" row.
     left: Option<DiffSegment>,
@@ -193,6 +193,79 @@ fn char_diff_range(line: &str, other: &str) -> Vec<(usize, usize)> {
         .collect()
 }
 
+// How many unchanged lines to keep on either side of a change. Anything beyond
+// that collapses into one elided marker, so a one-line edit in a 10k-line file
+// sends a dozen rows across the wire instead of ten thousand.
+const DIFF_CONTEXT: usize = 3;
+
+// The kind marker for a collapsed run of unchanged lines. Kept outside the
+// printable range so it cannot be mistaken for a character a real line holds.
+const ELIDED: char = '\u{00A6}';
+
+fn elided_text(lines: usize) -> String {
+    format!("已省略 {lines} 行")
+}
+
+/// Collapse runs of unchanged lines down to a window around the nearest change,
+/// the way `diff -U3` breaks a long file into hunks. The DP already only covers
+/// the trimmed middle, but the output still carried every context line of the
+/// file, so a huge file with one edit rendered ten thousand DOM rows for one
+/// changed line.
+///
+/// A run in front of the first change keeps its tail, one behind the last
+/// change keeps its head, and one between two changes keeps both ends with the
+/// middle elided. A diff with no change at all is returned untouched: there is
+/// nothing to window on, and an "elided" marker would misreport a diff that has
+/// no difference.
+fn window_ops(ops: Vec<(char, String)>) -> Vec<(char, String)> {
+    let mut segs: Vec<(bool, usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < ops.len() {
+        let is_context = ops[i].0 == ' ';
+        let from = i;
+        while i < ops.len() && (ops[i].0 == ' ') == is_context {
+            i += 1;
+        }
+        segs.push((is_context, from, i - from));
+    }
+    if !segs.iter().any(|(is_context, _, _)| !*is_context) {
+        return ops;
+    }
+
+    let mut out: Vec<(char, String)> = Vec::new();
+    for (idx, (is_context, from, len)) in segs.iter().enumerate() {
+        let body = &ops[*from..*from + *len];
+        if !*is_context {
+            out.extend_from_slice(body);
+            continue;
+        }
+        let keep = DIFF_CONTEXT.min(*len);
+        if idx == 0 {
+            let skip = *len - keep;
+            if skip > 0 {
+                out.push((ELIDED, elided_text(skip)));
+            }
+            out.extend_from_slice(&body[skip..]);
+        } else if idx + 1 == segs.len() {
+            out.extend_from_slice(&body[..keep]);
+            let skip = *len - keep;
+            if skip > 0 {
+                out.push((ELIDED, elided_text(skip)));
+            }
+        } else {
+            let head = keep;
+            let tail = DIFF_CONTEXT.min(*len - head);
+            let middle = *len - head - tail;
+            out.extend_from_slice(&body[..head]);
+            if middle > 0 {
+                out.push((ELIDED, elided_text(middle)));
+            }
+            out.extend_from_slice(&body[*len - tail..]);
+        }
+    }
+    out
+}
+
 /// Split a linear diff op stream into aligned row pairs.
 fn align_rows(ops: Vec<(char, String)>) -> Vec<DiffRow> {
     let mut rows = Vec::new();
@@ -210,6 +283,18 @@ fn align_rows(ops: Vec<(char, String)>) -> Vec<DiffRow> {
                     text: text.clone(),
                     highlights: Vec::new(),
                 }),
+            });
+            i += 1;
+        } else if *kind == ELIDED {
+            // One row spanning both columns, not a line pair: it names the run
+            // that was left out rather than showing it.
+            rows.push(DiffRow {
+                kind: "elided".to_string(),
+                left: Some(DiffSegment {
+                    text: text.clone(),
+                    highlights: Vec::new(),
+                }),
+                right: None,
             });
             i += 1;
         } else {
@@ -373,7 +458,7 @@ pub(crate) async fn get_diff(repo_path: String, path: String) -> Result<FileDiff
             .and_then(|p| std::fs::read(p).ok())
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
             .unwrap_or_default();
-        let rows = align_rows(diff_strings(&base, &target)?);
+        let rows = align_rows(window_ops(diff_strings(&base, &target)?));
         Ok(FileDiff { path, rows })
     })
     .await
@@ -420,7 +505,7 @@ pub(crate) async fn get_commit_file_diff(
             .unwrap_or_else(|| Ok(String::new()))?;
 
         let ops = diff_strings(&old_content, &new_content)?;
-        let rows = align_rows(ops);
+        let rows = align_rows(window_ops(ops));
         Ok(FileDiff { path, rows })
     })
     .await
@@ -430,7 +515,7 @@ pub(crate) async fn get_commit_file_diff(
 
 #[cfg(test)]
 mod tests {
-    use super::{char_diff_range, diff_strings};
+    use super::{align_rows, char_diff_range, diff_strings, window_ops, DIFF_CONTEXT, ELIDED};
 
     // ── diff：公共前后缀裁剪 + DP 规模上限 ──
 
@@ -475,6 +560,150 @@ mod tests {
         let ops = diff_strings(&base.join("\n"), &target.join("\n")).unwrap();
         let changed: Vec<_> = ops.iter().filter(|(k, _)| *k != ' ').collect();
         assert_eq!(changed.len(), 2);
+    }
+
+    // ── diff：上下文窗口 ──
+
+    #[test]
+    fn huge_file_window_shrinks_to_the_change() {
+        // 1 万行文件改 1 行：前缀裁剪让 DP 只算 1 行，但输出仍带全部上下文——
+        // 窗口把整条输出收到 2×DIFF_CONTEXT 的邻行加两条省略标记。
+        let mut base: Vec<String> = (0..10_000).map(|i| format!("line-{i}")).collect();
+        let mut target = base.clone();
+        target[5_000] = "changed".into();
+        base[5_000] = "orig".into();
+        let ops = window_ops(diff_strings(&base.join("\n"), &target.join("\n")).unwrap());
+
+        assert!(
+            ops.len() <= DIFF_CONTEXT * 2 + 2 + 2,
+            "windowed to {} rows for one changed line",
+            ops.len()
+        );
+        assert_eq!(
+            ops.iter().filter(|(k, _)| matches!(k, '-' | '+')).count(),
+            2
+        );
+        let elided: Vec<_> = ops.iter().filter(|(k, _)| *k == ELIDED).collect();
+        assert_eq!(elided.len(), 2, "ops = {ops:?}");
+        // 窗口要贴着改动：保留改动的直接邻行，而不是文件的头尾。
+        let ctx: Vec<&str> = ops
+            .iter()
+            .filter(|(k, _)| *k == ' ')
+            .map(|(_, t)| t.as_str())
+            .collect();
+        assert_eq!(
+            ctx,
+            vec![
+                "line-4997",
+                "line-4998",
+                "line-4999",
+                "line-5001",
+                "line-5002",
+                "line-5003"
+            ]
+        );
+        // 省掉的对得上：6 行上下文 + 1 行改动 = 7 行，其余 9993 行被折叠。
+        assert!(
+            elided[0].1.contains("4997"),
+            "head elision = {}",
+            elided[0].1
+        );
+        assert!(
+            elided[1].1.contains("4996"),
+            "tail elision = {}",
+            elided[1].1
+        );
+        // 守恒：显示的行 + 折叠的行必须等于原文件行数，一行都不许丢。
+        let elided_lines: usize = elided
+            .iter()
+            .map(|(_, t)| {
+                t.trim_start_matches("已省略 ")
+                    .trim_end_matches(" 行")
+                    .parse::<usize>()
+                    .expect("elision marker is parseable")
+            })
+            .sum();
+        assert_eq!(elided_lines + ctx.len() + 1, 10_000);
+    }
+
+    #[test]
+    fn two_distant_changes_elide_only_the_middle() {
+        let mut base: Vec<String> = (0..200).map(|i| format!("line-{i}")).collect();
+        let mut target = base.clone();
+        target[10] = "A'".into();
+        target[190] = "Z'".into();
+        base[10] = "A".into();
+        base[190] = "Z".into();
+        let ops = window_ops(diff_strings(&base.join("\n"), &target.join("\n")).unwrap());
+
+        let elided: Vec<_> = ops.iter().filter(|(k, _)| *k == ELIDED).collect();
+        // 头部、中段、尾部各一条标记；中段是真正被折叠的部分。
+        assert_eq!(elided.len(), 3, "ops = {ops:?}");
+        assert!(
+            elided[1].1.contains("173"),
+            "middle elision = {}",
+            elided[1].1
+        );
+        let ctx: Vec<&str> = ops
+            .iter()
+            .filter(|(k, _)| *k == ' ')
+            .map(|(_, t)| t.as_str())
+            .collect();
+        assert_eq!(ctx.len(), DIFF_CONTEXT * 4);
+        assert_eq!(
+            ctx,
+            vec![
+                "line-7", "line-8", "line-9", "line-11", "line-12", "line-13", "line-187",
+                "line-188", "line-189", "line-191", "line-192", "line-193"
+            ]
+        );
+    }
+
+    #[test]
+    fn short_boundary_runs_elide_their_extra() {
+        // 头尾上下文不足 2×DIFF_CONTEXT 时只留紧邻改动的那几条。
+        let base = "a\nb\n1\n2\n3\n4\n5\n6\n7\n8\n9\nc";
+        let target = "a\nb\n1\n2\n3\nX\n5\n6\n7\n8\n9\nc";
+        let ops = window_ops(diff_strings(base, target).unwrap());
+
+        let ctx: Vec<&str> = ops
+            .iter()
+            .filter(|(k, _)| *k == ' ')
+            .map(|(_, t)| t.as_str())
+            .collect();
+        assert_eq!(ctx, vec!["1", "2", "3", "5", "6", "7"]);
+        let elided: Vec<_> = ops.iter().filter(|(k, _)| *k == ELIDED).collect();
+        assert_eq!(elided.len(), 2, "ops = {ops:?}");
+        assert!(elided[0].1.contains("2"), "head elision = {}", elided[0].1);
+        assert!(elided[1].1.contains("3"), "tail elision = {}", elided[1].1);
+    }
+
+    #[test]
+    fn identical_files_bypass_the_window() {
+        // 没有改动就没有可依附的窗口；省略标记会谎报一个本没有差异的 diff。
+        let file: String = (0..5000)
+            .map(|i| format!("line-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let ops = window_ops(diff_strings(&file, &file).unwrap());
+        assert_eq!(ops.len(), 5000);
+        assert!(ops.iter().all(|(k, _)| *k == ' '));
+    }
+
+    #[test]
+    fn elided_marker_becomes_its_own_row() {
+        // 省略标记要和 context 行一样进 align_rows，不能被并进一个 '+' 行。
+        let ops = vec![
+            (' ', "keep".to_string()),
+            (ELIDED, "已省略 3 行".to_string()),
+            ('+', "new".to_string()),
+        ];
+        let rows = align_rows(ops);
+        let kinds: Vec<&str> = rows.iter().map(|r| r.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["context", "elided", "added"]);
+        let elided = &rows[1];
+        assert!(elided.left.is_some());
+        assert!(elided.right.is_none());
     }
 
     // ── diff：行内高亮区间按 UTF-16 码元计（前端 String.slice 的单位）──
