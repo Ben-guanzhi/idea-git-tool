@@ -220,6 +220,10 @@ function App() {
       );
       setTagSel((prev) => (prev && !tg.some((t) => t.name === prev) ? "" : prev));
     } catch (e) {
+      // A newer refresh may have started while this one was in flight; a stale
+      // failure must not clobber the error of a fresher view (mirror of the
+      // seq check on the success path above).
+      if (seq !== refreshSeq.current) return;
       setError(String(e));
     }
   }, [repoPath]);
