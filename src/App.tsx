@@ -26,6 +26,7 @@ import {
   type ConflictInfo,
   type FileContent,
   type FileDiff,
+  type LogPage,
   type MergeResult,
   type OpLogEntry,
   type StashInfo,
@@ -39,6 +40,8 @@ import {
   COMMIT_EXPLORER_INITIAL,
 } from "./viewState";
 import "./App.css";
+
+const LOG_PAGE_SIZE = 50;
 
 function App() {
   const [repoPath, setRepoPath] = useState(
@@ -68,6 +71,7 @@ function App() {
     FILE_VIEW_INITIAL
   );
   const [logs, setLogs] = useState<CommitSummary[]>([]);
+  const [logHasMore, setLogHasMore] = useState(false);
   const [branches, setBranches] = useState<BranchInfo[]>([]);
   const [explorer, dispatchExplorer] = useReducer(
     commitExplorerReducer,
@@ -318,17 +322,23 @@ function App() {
   );
   const currentBranchName = status?.branch ?? "";
 
-  async function loadLog() {
+  async function loadLog(offset = 0) {
     setError("");
     try {
-      const r = await invoke<CommitSummary[]>("get_log", {
+      const r = await invoke<LogPage>("get_log", {
         repoPath,
-        limit: 50,
+        limit: LOG_PAGE_SIZE,
+        offset,
       });
-      setLogs(r);
+      setLogs((prev) => (offset === 0 ? r.rows : [...prev, ...r.rows]));
+      setLogHasMore(r.hasMore);
     } catch (e) {
       setError(String(e));
     }
+  }
+
+  async function loadMoreLog() {
+    await loadLog(logs.length);
   }
 
   async function selectCommit(id: string) {
@@ -956,6 +966,8 @@ function App() {
         {tab === "log" && (
           <LogPane
             logs={logs}
+            hasMore={logHasMore}
+            onLoadMore={() => void loadMoreLog()}
             selectedCommit={explorer.commit}
             files={explorer.files}
             selectedFile={explorer.file}

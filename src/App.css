@@ -773,6 +773,14 @@ button {
   padding-left: 5px;
 }
 
+.log-more {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+  padding: 6px 8px;
+  font-size: 0.8em;
+}
+
 .commit-files {
   flex: 0 0 240px;
   min-width: 0;

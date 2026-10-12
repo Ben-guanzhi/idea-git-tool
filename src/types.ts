@@ -60,6 +60,11 @@ export interface CommitSummary {
   refs: string[];
 }
 
+export interface LogPage {
+  rows: CommitSummary[];
+  hasMore: boolean;
+}
+
 export interface BranchInfo {
   name: string;
   isCurrent: boolean;

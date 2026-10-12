@@ -6,6 +6,8 @@ import type { CommitFile, CommitSummary } from "./types";
 
 export function LogPane({
   logs,
+  hasMore,
+  onLoadMore,
   selectedCommit,
   files,
   selectedFile,
@@ -16,6 +18,8 @@ export function LogPane({
   onSelectFile,
 }: {
   logs: CommitSummary[];
+  hasMore: boolean;
+  onLoadMore: () => void;
   selectedCommit: string | null;
   files: CommitFile[];
   selectedFile: string | null;
@@ -53,6 +57,11 @@ export function LogPane({
             </div>
           ))}
           {logs.length === 0 && <div className="muted">No commits yet.</div>}
+          {hasMore && (
+            <button className="btn log-more" onClick={onLoadMore}>
+              Load more
+            </button>
+          )}
         </div>
 
         <aside className="commit-files">

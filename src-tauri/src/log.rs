@@ -18,6 +18,19 @@ pub(crate) struct CommitSummary {
     refs: Vec<String>,
 }
 
+/// One page of the log plus whether history continues past it.
+///
+/// `has_more` is decided by peeking one commit beyond the page, so the last
+/// page reports exactly what it shows rather than guessing from "the page
+/// came back full" — a boundary-sized history is otherwise indistinguishable
+/// from one with a commit left on the table.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LogPage {
+    rows: Vec<CommitSummary>,
+    has_more: bool,
+}
+
 /// Which names point at each commit, gathered in one pass. Scanning every
 /// reference for every commit made the log Θ(commits × references) and read
 /// the whole refs store once per row of the graph.
@@ -59,8 +72,9 @@ fn commit_to_summary(
 pub(crate) async fn get_log(
     repo_path: String,
     limit: Option<u32>,
-) -> Result<Vec<CommitSummary>, String> {
-    tauri::async_runtime::spawn_blocking(move || get_log_impl(&repo_path, limit))
+    offset: Option<u32>,
+) -> Result<LogPage, String> {
+    tauri::async_runtime::spawn_blocking(move || get_log_impl(&repo_path, limit, offset))
         .await
         .map_err(|e| format!("log task failed: {e}"))?
 }
@@ -68,7 +82,8 @@ pub(crate) async fn get_log(
 pub(crate) fn get_log_impl(
     repo_path: &str,
     limit: Option<u32>,
-) -> Result<Vec<CommitSummary>, String> {
+    offset: Option<u32>,
+) -> Result<LogPage, String> {
     let repo = open_repo(repo_path)?;
     let mut revwalk = repo.revwalk().map_err(|e| e.to_string())?;
     revwalk.push_head().map_err(|e| e.to_string())?;
@@ -77,19 +92,30 @@ pub(crate) fn get_log_impl(
         .map_err(|e| e.to_string())?;
 
     let refs = refs_by_target(&repo);
-    let mut out = Vec::new();
-    for oid in revwalk {
-        let oid = oid.map_err(|e| e.to_string())?;
-        let commit = repo.find_commit(oid).map_err(|e| e.to_string())?;
-        let s = commit_to_summary(&commit, &refs);
-        out.push(s);
+    let skip = offset.unwrap_or(0) as usize;
+    let mut rows = Vec::new();
+    let mut has_more = false;
+    let mut seen = 0usize;
+    let mut iter = revwalk.peekable();
+
+    while let Some(item) = iter.next() {
+        // Past the page's end: whether the next object parses settles "is
+        // there more". A broken object is not more history.
         if let Some(l) = limit {
-            if out.len() as u32 >= l {
+            if rows.len() == l as usize {
+                has_more = iter.peek().map(|next| next.is_ok()).unwrap_or(false);
                 break;
             }
         }
+        let oid = item.map_err(|e| e.to_string())?;
+        seen += 1;
+        if seen <= skip {
+            continue;
+        }
+        let commit = repo.find_commit(oid).map_err(|e| e.to_string())?;
+        rows.push(commit_to_summary(&commit, &refs));
     }
-    Ok(out)
+    Ok(LogPage { rows, has_more })
 }
 
 #[derive(Serialize)]
@@ -167,24 +193,48 @@ mod tests {
     use super::{get_log_impl, refs_by_target};
     use std::path::PathBuf;
 
-    fn scratch_repo(tag: &str) -> (git2::Repository, PathBuf) {
-        let path = std::env::temp_dir().join(format!("idea-git-log-{tag}"));
-        let _ = std::fs::remove_dir_all(&path);
-        let repo = git2::Repository::init(&path).expect("init");
-        std::fs::write(path.join("f.txt"), b"1").expect("write");
+    // Commits get explicit, strictly increasing times: sort is by commit time,
+    // so two commits in the same second would tie and the page order would be
+    // whatever the traversal happened to produce.
+    fn commit_at(
+        repo: &git2::Repository,
+        path: &std::path::Path,
+        msg: &str,
+        body: &[u8],
+        secs: i64,
+    ) {
+        std::fs::write(path.join("f.txt"), body).expect("write");
         let tree_oid = {
             let mut idx = repo.index().expect("index");
             idx.add_all(["f.txt"].iter(), git2::IndexAddOption::DEFAULT, None)
                 .expect("add");
             idx.write_tree().expect("write tree")
         };
+        let tree = repo.find_tree(tree_oid).expect("tree");
+        let when = git2::Time::new(secs, 0);
+        let sig = git2::Signature::new("t", "t@example.com", &when).expect("sig");
+        // An empty parent list means a root commit, which libgit2 refuses to
+        // create on top of an already born HEAD.
+        let parent = match repo.head().map(|r| r.target()) {
+            Ok(Some(target)) => Some(repo.find_commit(target).expect("parent commit")),
+            _ => None,
+        };
+        let parents: Vec<&git2::Commit> = match parent.as_ref() {
+            Some(p) => vec![p],
+            None => vec![],
+        };
+        repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &parents)
+            .expect("commit");
+    }
+
+    fn scratch_repo(tag: &str) -> (git2::Repository, PathBuf) {
+        let path = std::env::temp_dir().join(format!("idea-git-log-{tag}"));
+        let _ = std::fs::remove_dir_all(&path);
+        let repo = git2::Repository::init(&path).expect("init");
+        commit_at(&repo, &path, "one", b"1", 1_000_000_000);
+        let head = repo.head().expect("head").target().expect("target");
         {
-            let tree = repo.find_tree(tree_oid).expect("tree");
-            let sig = git2::Signature::now("t", "t@example.com").expect("sig");
-            let oid = repo
-                .commit(Some("HEAD"), &sig, &sig, "one", &tree, &[])
-                .expect("commit");
-            let commit = repo.find_commit(oid).expect("commit object");
+            let commit = repo.find_commit(head).expect("commit");
             repo.branch("feature", &commit, false).expect("branch");
         }
         (repo, path)
@@ -208,11 +258,110 @@ mod tests {
     fn get_log_rows_carry_their_refs() {
         let (repo, path) = scratch_repo("log");
         drop(repo);
-        let out = get_log_impl(path.to_str().expect("utf8"), None).expect("log");
-        assert_eq!(out.len(), 1);
-        let mut refs = out[0].refs.clone();
+        let page = get_log_impl(path.to_str().expect("utf8"), None, None).expect("log");
+        assert_eq!(page.rows.len(), 1);
+        assert!(!page.has_more);
+        let mut refs = page.rows[0].refs.clone();
         refs.sort();
         let _ = std::fs::remove_dir_all(&path);
         assert_eq!(refs, vec!["feature".to_string(), "master".to_string()]);
+    }
+
+    // Paging must hand back the whole history exactly once — no commit lost at
+    // a page boundary, no repeat. Before the offset the log was a single fixed
+    // 50-row window and everything older was simply unreachable.
+    #[test]
+    fn log_pages_cover_the_history_exactly_once() {
+        let (repo, path) = scratch_repo("pages");
+        for i in 1..=7u32 {
+            commit_at(
+                &repo,
+                &path,
+                &format!("c{i}"),
+                &[10 + i as u8],
+                1_000_000_000 + i as i64 * 1000,
+            );
+        }
+        drop(repo);
+        let log = path.to_str().expect("utf8");
+
+        let mut messages = Vec::new();
+        let mut offset = 0u32;
+        let mut guard = 0;
+        loop {
+            let page = get_log_impl(log, Some(3), Some(offset)).expect("page");
+            guard += 1;
+            assert!(guard <= 20, "paging must terminate");
+            messages.extend(page.rows.iter().map(|r| r.message.clone()));
+            offset += page.rows.len() as u32;
+            if !page.has_more {
+                break;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&path);
+        assert_eq!(
+            messages,
+            vec!["c7", "c6", "c5", "c4", "c3", "c2", "c1", "one"],
+            "newest first, every commit exactly once"
+        );
+    }
+
+    // A history whose size is an exact multiple of the page size must not be
+    // reported as having more: "the page came back full" is not evidence.
+    #[test]
+    fn a_boundary_sized_history_reports_no_more() {
+        let (repo, path) = scratch_repo("boundary");
+        for i in 1..=3u32 {
+            commit_at(
+                &repo,
+                &path,
+                &format!("c{i}"),
+                &[20 + i as u8],
+                1_000_000_000 + i as i64 * 1000,
+            );
+        }
+        drop(repo);
+        let log = path.to_str().expect("utf8");
+
+        let page = get_log_impl(log, Some(2), Some(0)).expect("page");
+        assert_eq!(page.rows.len(), 2);
+        assert!(page.has_more, "two more commits exist");
+        let rest = get_log_impl(log, Some(2), Some(2)).expect("rest");
+        assert_eq!(rest.rows.len(), 2);
+        assert!(!rest.has_more, "the page filled the history exactly");
+        let past = get_log_impl(log, Some(2), Some(4)).expect("past");
+        assert!(past.rows.is_empty());
+        assert!(!past.has_more, "nothing beyond the end");
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    // Offsetting must be exact: skipping rows must not shift the window.
+    #[test]
+    fn an_offset_skips_without_shifting_the_window() {
+        let (repo, path) = scratch_repo("offset");
+        for i in 1..=5u32 {
+            commit_at(
+                &repo,
+                &path,
+                &format!("c{i}"),
+                &[30 + i as u8],
+                1_000_000_000 + i as i64 * 1000,
+            );
+        }
+        drop(repo);
+        let log = path.to_str().expect("utf8");
+
+        let first = get_log_impl(log, Some(2), None).expect("first");
+        let second = get_log_impl(log, Some(2), Some(2)).expect("second");
+        let _ = std::fs::remove_dir_all(&path);
+        assert_eq!(
+            first
+                .rows
+                .iter()
+                .map(|r| r.message.clone())
+                .chain(second.rows.iter().map(|r| r.message.clone()))
+                .collect::<Vec<_>>(),
+            vec!["c5", "c4", "c3", "c2"]
+        );
     }
 }
