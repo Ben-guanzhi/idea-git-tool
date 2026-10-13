@@ -1,6 +1,16 @@
 //! Tauri backend for the Git tool. Commands live in per-domain modules;
 //! this file only wires them into the invoke handler.
 
+#[cfg(test)]
+mod alloc_count;
+
+/// Test-only counting allocator (see `alloc_count`). It forwards every request
+/// to the system allocator, so the only thing it changes is that a test can see
+/// how many heap operations its own thread performed.
+#[cfg(test)]
+#[global_allocator]
+static COUNTING: alloc_count::Counting = alloc_count::Counting;
+
 mod branch;
 mod diff;
 mod log;
