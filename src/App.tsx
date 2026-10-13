@@ -1,839 +1,129 @@
-import {
-  useReducer,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
-import { invoke } from "@tauri-apps/api/core";
+// App is the composition layer: the state clusters that used to live inline
+// here were moved verbatim into src/hooks/* (one hook per cluster). The hook
+// call order below preserves the original App.tsx effect order:
+// refresh / repo-persist (useRepoStatus), info/error dismiss (useRepoStatus),
+// keyboard shortcuts (useCommitFlow), file-diff load (useSelectedFileDiff).
+
 import { ConflictEditor } from "./ConflictEditor";
-import { diffRowsToJsx } from "./DiffView";
 import { FileList } from "./FileTree";
+import { HunkPanel } from "./HunkPanel";
 import { LogPane } from "./LogPane";
 import { OpsPanel } from "./OpsPanel";
 import { TopBar } from "./TopBar";
 import { BranchActions } from "./BranchActions";
 import { StashTagBar } from "./StashTagBar";
 import { CommitPanel } from "./CommitPanel";
-import {
-  OPS_KEY,
-  REPO_KEY,
-  type BranchInfo,
-  type BusyKey,
-  type CommitFile,
-  type CommitSummary,
-  type ConflictInfo,
-  type FileContent,
-  type FileDiff,
-  type LogPage,
-  type MergeResult,
-  type OpLogEntry,
-  type StashInfo,
-  type StatusInfo,
-  type TagInfo,
-} from "./types";
-import {
-  fileViewReducer,
-  FILE_VIEW_INITIAL,
-  commitExplorerReducer,
-  COMMIT_EXPLORER_INITIAL,
-} from "./viewState";
+import { useBranchOps } from "./hooks/useBranchOps";
+import { useCommitFlow } from "./hooks/useCommitFlow";
+import { useCommitLog } from "./hooks/useCommitLog";
+import { useConflict } from "./hooks/useConflict";
+import { useFileSelection } from "./hooks/useFileSelection";
+import { useHunks } from "./hooks/useHunks";
+import { useOpsPanel } from "./hooks/useOpsPanel";
+import { useRepoStatus } from "./hooks/useRepoStatus";
+import { useSelectedFileDiff } from "./hooks/useSelectedFileDiff";
+import { useStashTags } from "./hooks/useStashTags";
+import { useTreeUi } from "./hooks/useTreeUi";
+
 import "./App.css";
 
-const LOG_PAGE_SIZE = 50;
-
 function App() {
-  const [repoPath, setRepoPath] = useState(
-    () => localStorage.getItem(REPO_KEY) ?? ""
-  );
-  const [status, setStatus] = useState<StatusInfo | null>(null);
-  const [conflicts, setConflicts] = useState<ConflictInfo[]>([]);
-  const [selectedFile, setSelectedFile] = useState<string | null>(null);
-  const [message, setMessage] = useState("");
-  const [tab, setTab] = useState<"changes" | "log">("changes");
-  const [branch, setBranch] = useState("");
-  const [mergeTarget, setMergeTarget] = useState("");
-  const [rebaseTarget, setRebaseTarget] = useState("");
-  const [rebaseInProgress, setRebaseInProgress] = useState(false);
-  const [stashes, setStashes] = useState<StashInfo[]>([]);
-  const [tags, setTags] = useState<TagInfo[]>([]);
-  const [stashSel, setStashSel] = useState<number | null>(null);
-  const [stashMsg, setStashMsg] = useState("");
-  const [tagInput, setTagInput] = useState("");
-  const [tagMsg, setTagMsg] = useState("");
-  const [tagSel, setTagSel] = useState("");
-  const [remote, setRemote] = useState("origin");
-  const [info, setInfo] = useState("");
-  const [error, setError] = useState("");
-  const [fileView, dispatchFileView] = useReducer(
-    fileViewReducer,
-    FILE_VIEW_INITIAL
-  );
-  const [logs, setLogs] = useState<CommitSummary[]>([]);
-  const [logHasMore, setLogHasMore] = useState(false);
-  const [branches, setBranches] = useState<BranchInfo[]>([]);
-  const [explorer, dispatchExplorer] = useReducer(
-    commitExplorerReducer,
-    COMMIT_EXPLORER_INITIAL
-  );
-  const [busy, setBusy] = useState<BusyKey>(null);
-  const [ops, setOps] = useState<OpLogEntry[]>([]);
-  const [opsOpen, setOpsOpen] = useState(
-    () => localStorage.getItem(OPS_KEY) === "1"
-  );
-  const [collapsedDirs, setCollapsedDirs] = useState<Set<string>>(new Set());
-  const [logCollapsed, setLogCollapsed] = useState<Set<string>>(new Set());
-  const [checkedPaths, setCheckedPaths] = useState<Set<string>>(new Set());
-  const opsIdRef = useRef(1);
-  const branchInputRef = useRef<HTMLInputElement>(null);
-
-  function logOp(op: string, status: OpLogEntry["status"], detail: string) {
-    const entry: OpLogEntry = {
-      id: opsIdRef.current++,
-      time: new Date().toLocaleTimeString(),
-      op,
-      status,
-      detail,
-    };
-    setOps((prev) => [entry, ...prev].slice(0, 200));
-    if (status === "error" && !opsOpen) {
-      setOpsOpen(true);
-      localStorage.setItem(OPS_KEY, "1");
-    }
-  }
-
-  function toggleOps() {
-    setOpsOpen((open) => {
-      const next = !open;
-      localStorage.setItem(OPS_KEY, next ? "1" : "0");
-      return next;
-    });
-  }
-
-  function exportOps() {
-    if (ops.length === 0) {
-      logOp("export", "info", "nothing to export");
-      return;
-    }
-    const header =
-      `# idea-git-tool operations\n` +
-      `# repo: ${repoPath || "(none)"}\n` +
-      `# exported: ${new Date().toISOString()}\n` +
-      `# entries: ${ops.length}\n` +
-      `# time\tstatus\top\tdetail\n`;
-    // ops is newest-first; reverse for chronological file.
-    const lines = [...ops]
-      .reverse()
-      .map((o) => `${o.time}\t${o.status}\t${o.op}\t${o.detail.replace(/\t/g, " ").replace(/\n/g, " ")}`)
-      .join("\n");
-    const blob = new Blob([header + lines + "\n"], {
-      type: "text/plain;charset=utf-8",
-    });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    const stamp = new Date()
-      .toISOString()
-      .replace(/[:.]/g, "-")
-      .slice(0, 19);
-    a.download = `git-ops-${stamp}.log`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-    logOp("export", "ok", `exported ${ops.length} entries`);
-  }
-
-  function toggleFileChecked(path: string) {
-    setCheckedPaths((prev) => {
-      const next = new Set(prev);
-      if (next.has(path)) next.delete(path);
-      else next.add(path);
-      return next;
-    });
-  }
-
-  function setDirChecked(dirPaths: string[], on: boolean) {
-    setCheckedPaths((prev) => {
-      const next = new Set(prev);
-      for (const p of dirPaths) {
-        if (on) next.add(p);
-        else next.delete(p);
-      }
-      return next;
-    });
-  }
-
-  function clearChecked() {
-    setCheckedPaths(new Set());
-  }
-
-  function toggleLogDir(path: string) {
-    // `path` is already `log:<dirPath>` from FileTreeView.
-    setLogCollapsed((prev) => {
-      const next = new Set(prev);
-      if (next.has(path)) next.delete(path);
-      else next.add(path);
-      return next;
-    });
-  }
-
-  const refreshSeq = useRef(0);
-
-  const refresh = useCallback(async () => {
-    setError("");
-    const seq = ++refreshSeq.current;
-    try {
-      // The queries are independent, so fetch them in parallel; they used to
-      // be awaited serially, each round-trip adding latency.
-      const [s, c, b, st, tg, rip] = await Promise.all([
-        invoke<StatusInfo>("get_status", { repoPath }),
-        invoke<ConflictInfo[]>("get_conflicts", { repoPath }),
-        invoke<BranchInfo[]>("list_branches", { repoPath }),
-        invoke<StashInfo[]>("list_stashes", { repoPath }),
-        invoke<TagInfo[]>("list_tags", { repoPath }),
-        invoke<boolean>("rebase_in_progress", { repoPath }),
-      ]);
-      // A newer refresh may have started while this one was in flight (F5
-      // pressed during a mutation, repoPath changed, etc.). Only the latest
-      // snapshot may apply, or a stale one could overwrite a fresher view.
-      if (seq !== refreshSeq.current) return;
-      setStatus(s);
-      // refresh is the single bookkeeper for checkbox validity: checked paths
-      // that no longer exist in the tree are pruned here, right where the new
-      // tree arrives. Stage/unstage uncheck their own paths on top of this.
-      setCheckedPaths((prev) => {
-        if (prev.size === 0) return prev;
-        const valid = new Set([
-          ...(s.staged ?? []).map((f) => f.path),
-          ...(s.unstaged ?? []).map((f) => f.path),
-        ]);
-        const next = new Set([...prev].filter((p) => valid.has(p)));
-        return next.size === prev.size ? prev : next;
-      });
-      setConflicts(c);
-      setBranches(b);
-      setStashes(st);
-      setTags(tg);
-      setRebaseInProgress(rip);
-      // The new snapshots may have invalidated the current selections
-      // (stash dropped, tag deleted by someone else): prune like checkedPaths.
-      setStashSel((prev) =>
-        prev !== null && !st.some((x) => x.index === prev) ? null : prev
-      );
-      setTagSel((prev) => (prev && !tg.some((t) => t.name === prev) ? "" : prev));
-    } catch (e) {
-      // A newer refresh may have started while this one was in flight; a stale
-      // failure must not clobber the error of a fresher view (mirror of the
-      // seq check on the success path above).
-      if (seq !== refreshSeq.current) return;
-      setError(String(e));
-    }
-  }, [repoPath]);
-
-  useEffect(() => {
-    if (repoPath.trim()) refresh();
-  }, [repoPath, refresh]);
-
-  useEffect(() => {
-    if (!repoPath.trim()) return;
-    localStorage.setItem(REPO_KEY, repoPath);
-  }, [repoPath]);
-
-  // Auto-dismiss banners.
-  useEffect(() => {
-    if (!info) return;
-    const t = setTimeout(() => setInfo(""), 4000);
-    return () => clearTimeout(t);
-  }, [info]);
-
-  useEffect(() => {
-    if (!error) return;
-    const t = setTimeout(() => setError(""), 8000);
-    return () => clearTimeout(t);
-  }, [error]);
-
-  const actionsRef = useRef({ doCommit, refresh, loadLog, tab, busy, message });
-  actionsRef.current = { doCommit, refresh, loadLog, tab, busy, message };
-
-  // Shortcuts: Ctrl/Cmd+Enter commit, F5 refresh.
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      const a = actionsRef.current;
-      if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
-        e.preventDefault();
-        if (a.tab === "changes" && !a.busy) void a.doCommit();
-      } else if (e.key === "F5") {
-        e.preventDefault();
-        void a.refresh();
-        if (a.tab === "log") void a.loadLog();
-      }
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
-
-  // Load file content + diff when a file is selected: one dispatch replaces
-  // the whole view, so the editor text and the diff can never disagree about
-  // which file they belong to.
-  useEffect(() => {
-    if (!selectedFile) {
-      dispatchFileView({ type: "clear" });
-      return;
-    }
-    let cancelled = false;
-    (async () => {
-      try {
-        const fc = await invoke<FileContent>("get_file_contents", {
-          repoPath,
-          path: selectedFile,
-        });
-        const d = await invoke<FileDiff>("get_diff", {
-          repoPath,
-          path: selectedFile,
-        });
-        if (!cancelled) {
-          dispatchFileView({
-            type: "loaded",
-            diff: d,
-            working: fc.working,
-            conflicted: fc.conflicted,
-            isBinary: fc.isBinary,
-          });
-        }
-      } catch (e) {
-        if (!cancelled) setError(String(e));
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [selectedFile, repoPath]);
-
-  const selectedConflict = useMemo(
-    () => conflicts.find((c) => c.path === selectedFile) ?? null,
-    [conflicts, selectedFile]
-  );
-
-  const mergeCandidates = useMemo(
-    () => branches.filter((b) => !b.isCurrent),
-    [branches]
-  );
-  const currentBranchName = status?.branch ?? "";
-
-  async function loadLog(offset = 0) {
-    setError("");
-    try {
-      const r = await invoke<LogPage>("get_log", {
-        repoPath,
-        limit: LOG_PAGE_SIZE,
-        offset,
-      });
-      setLogs((prev) => (offset === 0 ? r.rows : [...prev, ...r.rows]));
-      setLogHasMore(r.hasMore);
-    } catch (e) {
-      setError(String(e));
-    }
-  }
-
-  async function loadMoreLog() {
-    await loadLog(logs.length);
-  }
-
-  async function selectCommit(id: string) {
-    dispatchExplorer({ type: "select", commit: id });
-    setError("");
-    try {
-      const files = await invoke<CommitFile[]>("get_commit_files", {
-        repoPath,
-        commitId: id,
-      });
-      dispatchExplorer({ type: "files", commit: id, files });
-      if (files.length > 0) {
-        await selectCommitFile(id, files[0].path);
-      }
-    } catch (e) {
-      setError(String(e));
-      dispatchExplorer({ type: "loadFailed" });
-    }
-  }
-
-  async function selectCommitFile(id: string, path: string) {
-    dispatchExplorer({ type: "selectFile", file: path });
-    try {
-      const d = await invoke<FileDiff>("get_commit_file_diff", {
-        repoPath,
-        commitId: id,
-        path,
-      });
-      dispatchExplorer({ type: "loaded", file: path, diff: d });
-    } catch (e) {
-      setError(String(e));
-    }
-  }
-
-  async function saveEdit() {
-    if (!selectedFile) return;
-    setError("");
-    try {
-      await invoke("write_file", {
-        repoPath,
-        path: selectedFile,
-        content: fileView.editText,
-      });
-      setInfo("File saved");
-      await refresh();
-    } catch (e) {
-      setError(String(e));
-    }
-  }
-
-  /**
-   * The one channel for every mutating operation: takes the busy lock so
-   * operations cannot interleave (a stage racing a push would corrupt the
-   * index view), logs the outcome, surfaces success as a banner and failure
-   * as an error, and refreshes the working-tree snapshot (plus the log when
-   * one is loaded or visible). `fn` runs the invokes; `onSuccess` may return
-   * the banner text, defaulting to the invoke result or `detail`.
-   */
-  async function runOp(opts: {
-    key: Exclude<BusyKey, null>;
-    op: string;
-    detail: string;
-    onSuccess?: (result: string) => string | void;
-    fn: () => Promise<string>;
-  }) {
-    if (busy) return;
-    setBusy(opts.key);
-    setError("");
-    setInfo("");
-    try {
-      const r = await opts.fn();
-      const detail = opts.onSuccess?.(r) ?? (r || opts.detail);
-      logOp(opts.op, "ok", detail);
-      setInfo(detail);
-      await refresh();
-      if (logs.length > 0 || tab === "log") await loadLog();
-    } catch (e) {
-      const msg = String(e);
-      logOp(opts.op, "error", msg);
-      setError(msg);
-      await refresh();
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  const stagedCount = status?.staged.length ?? 0;
-  const unstagedCount = status?.unstaged.length ?? 0;
-  const hasChanges = stagedCount > 0 || unstagedCount > 0;
-  const canCommit = !!message.trim() && hasChanges && !busy;
-
-  const stagedAll = useMemo(
-    () => (status?.staged ?? []).map((f) => f.path),
-    [status]
-  );
-  const unstagedAll = useMemo(
-    () => (status?.unstaged ?? []).map((f) => f.path),
-    [status]
-  );
-  const stagedChecked = useMemo(
-    () => stagedAll.filter((p) => checkedPaths.has(p)),
-    [stagedAll, checkedPaths]
-  );
-  const unstagedChecked = useMemo(
-    () => unstagedAll.filter((p) => checkedPaths.has(p)),
-    [unstagedAll, checkedPaths]
-  );
-
-  async function doStage(paths: string[]) {
-    if (paths.length === 0) return;
-    await runOp({
-      key: "stage",
-      op: "stage",
-      detail: `${paths.length} file(s)`,
-      onSuccess: () => {
-        setCheckedPaths((prev) => {
-          const n = new Set(prev);
-          for (const p of paths) n.delete(p);
-          return n;
-        });
-      },
-      fn: async () => {
-        await invoke("stage", { repoPath, paths });
-        return "";
-      },
-    });
-  }
-
-  async function doUnstage(paths: string[]) {
-    if (paths.length === 0) return;
-    await runOp({
-      key: "unstage",
-      op: "unstage",
-      detail: `${paths.length} file(s)`,
-      onSuccess: () => {
-        setCheckedPaths((prev) => {
-          const n = new Set(prev);
-          for (const p of paths) n.delete(p);
-          return n;
-        });
-      },
-      fn: async () => {
-        await invoke("unstage", { repoPath, paths });
-        return "";
-      },
-    });
-  }
-
-  async function doDiscard(paths: string[]) {
-    if (paths.length === 0) return;
-    const label =
-      paths.length === 1 ? paths[0] : `${paths.length} files`;
-    if (!window.confirm(`Discard changes for ${label}? This cannot be undone.`)) {
-      logOp("discard", "info", `cancelled: ${label}`);
-      return;
-    }
-    await runOp({
-      key: "discard",
-      op: "discard",
-      detail: label,
-      onSuccess: () => {
-        if (selectedFile && paths.includes(selectedFile)) setSelectedFile(null);
-        return `Discarded ${label}`;
-      },
-      fn: async () => {
-        await invoke("discard", { repoPath, paths });
-        return "";
-      },
-    });
-  }
-
-  async function doCommit() {
-    if (!message.trim()) {
-      setError("请输入提交信息 (Commit message is required)");
-      return;
-    }
-    if (stagedCount === 0 && unstagedCount === 0) {
-      setError("没有可提交的更改 (nothing to commit)");
-      return;
-    }
-    const subject = message.trim().split("\n")[0];
-    await runOp({
-      key: "commit",
-      op: "commit",
-      detail: subject,
-      onSuccess: () => setMessage(""),
-      fn: async () => {
-        // Nothing staged yet: stage all unstaged changes first (Stage & Commit).
-        if (stagedCount === 0 && unstagedCount > 0) {
-          await invoke("stage", {
-            repoPath,
-            paths: (status?.unstaged ?? []).map((f) => f.path),
-          });
-          logOp("stage", "ok", `auto (stage & commit): ${unstagedCount} file(s)`);
-        }
-        const r = await invoke<string>("commit", {
-          args: { repoPath, message, authorName: "", authorEmail: "" },
-        });
-        return `Committed ${r.slice(0, 12)} — ${subject}`;
-      },
-    });
-  }
-
-  async function doPush() {
-    await runOp({
-      key: "push",
-      op: "push",
-      detail: `→ ${remote}`,
-      fn: async () => invoke<string>("push", { repoPath, remote }),
-    });
-  }
-
-  async function doPull() {
-    await runOp({
-      key: "pull",
-      op: "pull",
-      detail: `← ${remote}`,
-      fn: async () => invoke<string>("pull", { repoPath, remote }),
-    });
-  }
-
-  async function doFetch() {
-    await runOp({
-      key: "fetch",
-      op: "fetch",
-      detail: remote,
-      fn: async () => invoke<string>("fetch", { repoPath, remote }),
-    });
-  }
-
-  async function doMerge() {
-    setError("");
-    setInfo("");
-    const target = mergeTarget.trim();
-    if (!target) {
-      setError("请先选择要合并的分支");
-      return;
-    }
-    await runOp({
-      key: "merge",
-      op: "merge",
-      detail: `merge ${target}`,
-      onSuccess: () => setMergeTarget(""),
-      fn: async () => {
-        const r = await invoke<MergeResult>("merge", { repoPath, branch: target });
-        if (r.status === "conflicts") {
-          setTab("changes");
-          if (r.conflicts.length > 0) {
-            setSelectedFile(r.conflicts[0]);
-          }
-          // The merge ran and produced conflicts: a business outcome, not an
-          // exception — surface it through the error banner as-is.
-          throw r.message;
-        }
-        return r.message;
-      },
-    });
-  }
-
-  async function doAbortMerge() {
-    await runOp({
-      key: "abort",
-      op: "abort merge",
-      detail: "",
-      onSuccess: () => setSelectedFile(null),
-      fn: async () => invoke<string>("abort_merge", { repoPath }),
-    });
-  }
-
-  async function doRebase() {
-    setError("");
-    setInfo("");
-    const target = rebaseTarget.trim();
-    if (!target) {
-      setError("请先选择要变基的目标分支");
-      return;
-    }
-    await runOp({
-      key: "rebase",
-      op: "rebase",
-      detail: `rebase onto ${target}`,
-      onSuccess: () => setRebaseTarget(""),
-      fn: async () => {
-        const r = await invoke<MergeResult>("rebase", { repoPath, branch: target });
-        if (r.status === "conflicts") {
-          setTab("changes");
-          if (r.conflicts.length > 0) {
-            setSelectedFile(r.conflicts[0]);
-          }
-          // Conflicts mid-rebase: same business-outcome channel as merge —
-          // the Continue/Abort buttons in the footer drive the rest.
-          throw r.message;
-        }
-        return r.message;
-      },
-    });
-  }
-
-  async function doRebaseContinue() {
-    await runOp({
-      key: "rebase",
-      op: "rebase continue",
-      detail: "",
-      fn: async () => invoke<string>("rebase_continue", { repoPath }),
-    });
-  }
-
-  async function doRebaseAbort() {
-    await runOp({
-      key: "rebase",
-      op: "rebase abort",
-      detail: "",
-      onSuccess: () => setSelectedFile(null),
-      fn: async () => invoke<string>("rebase_abort", { repoPath }),
-    });
-  }
-
-  async function doStashSave() {
-    const msg = stashMsg.trim();
-    await runOp({
-      key: "stash",
-      op: "stash save",
-      detail: msg || "(default message)",
-      onSuccess: () => {
-        setStashMsg("");
-        setStashSel(0);
-      },
-      fn: async () =>
-        invoke<string>("stash_save", { repoPath, message: msg || null }),
-    });
-  }
-
-  async function doStashApply() {
-    if (stashSel === null) return;
-    const idx = stashSel;
-    await runOp({
-      key: "stash",
-      op: "stash apply",
-      detail: `stash@{${idx}}`,
-      fn: async () => invoke<string>("stash_apply", { repoPath, index: idx }),
-    });
-  }
-
-  async function doStashPop() {
-    if (stashSel === null) return;
-    const idx = stashSel;
-    await runOp({
-      key: "stash",
-      op: "stash pop",
-      detail: `stash@{${idx}}`,
-      onSuccess: () => setStashSel(null),
-      fn: async () => invoke<string>("stash_pop", { repoPath, index: idx }),
-    });
-  }
-
-  async function doStashDrop() {
-    if (stashSel === null) return;
-    const label = `stash@{${stashSel}}`;
-    if (!window.confirm(`Drop ${label}? This cannot be undone.`)) {
-      logOp("stash drop", "info", `cancelled: ${label}`);
-      return;
-    }
-    await runOp({
-      key: "stash",
-      op: "stash drop",
-      detail: label,
-      onSuccess: () => setStashSel(null),
-      fn: async () => invoke<string>("stash_drop", { repoPath, index: stashSel! }),
-    });
-  }
-
-  async function doCreateTag() {
-    const name = tagInput.trim();
-    if (!name) {
-      setError("请输入标签名称 (Tag name is required)");
-      return;
-    }
-    const msg = tagMsg.trim();
-    await runOp({
-      key: "tag",
-      op: "tag",
-      detail: `create ${name}`,
-      onSuccess: () => {
-        setTagInput("");
-        setTagMsg("");
-        setTagSel(name);
-      },
-      fn: async () =>
-        invoke<string>("create_tag", { repoPath, name, message: msg || null }),
-    });
-  }
-
-  async function doDeleteTag() {
-    const name = tagSel;
-    if (!name) return;
-    if (!window.confirm(`Delete tag "${name}"? This cannot be undone.`)) {
-      logOp("tag delete", "info", `cancelled: ${name}`);
-      return;
-    }
-    await runOp({
-      key: "tag",
-      op: "tag delete",
-      detail: `delete ${name}`,
-      onSuccess: () => setTagSel(""),
-      fn: async () => invoke<string>("delete_tag", { repoPath, name }),
-    });
-  }
-
-  async function doCheckout(name: string) {
-    if (!name) return;
-    await runOp({
-      key: "checkout",
-      op: "checkout",
-      detail: `→ ${name}`,
-      onSuccess: () => setSelectedFile(null),
-      fn: async () => invoke<string>("checkout", { repoPath, branch: name }),
-    });
-  }
-
-  async function doCreateBranch() {
-    if (!branch.trim()) {
-      setError("请输入分支名称 (Branch name is required)");
-      branchInputRef.current?.focus();
-      return;
-    }
-    await runOp({
-      key: "branch",
-      op: "branch",
-      detail: `create ${branch.trim()}`,
-      onSuccess: () => setBranch(""),
-      fn: async () => invoke<string>("create_branch", { repoPath, name: branch.trim() }),
-    });
-  }
-
-  async function doResolve(path: string, choice: string) {
-    await runOp({
-      key: "resolve",
-      op: "resolve",
-      detail: `${path} (${choice})`,
-      fn: async () => {
-        await invoke("resolve_conflict", { repoPath, paths: [path], choice });
-        return "";
-      },
-    });
-  }
-
-  function toggleDir(path: string) {
-    setCollapsedDirs((prev) => {
-      const next = new Set(prev);
-      if (next.has(path)) next.delete(path);
-      else next.add(path);
-      return next;
-    });
-  }
-
-  const diffView = useMemo(() => diffRowsToJsx(fileView.diff), [fileView.diff]);
-
-  const commitDiffView = useMemo(
-    () => diffRowsToJsx(explorer.diff),
-    [explorer.diff]
-  );
+  const repo = useRepoStatus();
+  const opsPanel = useOpsPanel(repo.repoPath);
+  const treeUi = useTreeUi();
+  const selection = useFileSelection();
+  const commitLog = useCommitLog(repo.repoPath, repo.setError);
+  const commitFlow = useCommitFlow({
+    repoPath: repo.repoPath,
+    status: repo.status,
+    refresh: repo.refresh,
+    loadLog: commitLog.loadLog,
+    logs: commitLog.logs,
+    tab: commitLog.tab,
+    logOp: opsPanel.logOp,
+    setError: repo.setError,
+    setInfo: repo.setInfo,
+    checkedPaths: repo.checkedPaths,
+    setCheckedPaths: repo.setCheckedPaths,
+    selectedFile: selection.selectedFile,
+    setSelectedFile: selection.setSelectedFile,
+  });
+  const fileDiff = useSelectedFileDiff({
+    repoPath: repo.repoPath,
+    selectedFile: selection.selectedFile,
+    refresh: repo.refresh,
+    setError: repo.setError,
+    setInfo: repo.setInfo,
+  });
+  const conflict = useConflict({
+    repoPath: repo.repoPath,
+    conflicts: repo.conflicts,
+    selectedFile: selection.selectedFile,
+    runOp: commitFlow.runOp,
+  });
+  const branchOps = useBranchOps({
+    repoPath: repo.repoPath,
+    branches: repo.branches,
+    status: repo.status,
+    runOp: commitFlow.runOp,
+    setError: repo.setError,
+    setInfo: repo.setInfo,
+    setTab: commitLog.setTab,
+    setSelectedFile: selection.setSelectedFile,
+  });
+  const stashTags = useStashTags({
+    repoPath: repo.repoPath,
+    runOp: commitFlow.runOp,
+    logOp: opsPanel.logOp,
+    setError: repo.setError,
+    stashSel: repo.stashSel,
+    setStashSel: repo.setStashSel,
+    tagSel: repo.tagSel,
+    setTagSel: repo.setTagSel,
+  });
+  const hunkOps = useHunks({
+    repoPath: repo.repoPath,
+    selectedFile: selection.selectedFile,
+    status: repo.status,
+    conflicts: repo.conflicts,
+    runOp: commitFlow.runOp,
+    setError: repo.setError,
+    loadFileView: fileDiff.loadFileView,
+  });
 
   return (
     <div className="ide">
       <TopBar
-        repoPath={repoPath}
-        onRepoPath={setRepoPath}
-        status={status}
-        branches={branches}
-        busy={busy}
-        branch={branch}
-        branchInputRef={branchInputRef}
-        onCheckout={doCheckout}
-        onFetch={doFetch}
-        onPull={doPull}
-        onPush={doPush}
-        onCreateBranch={doCreateBranch}
+        repoPath={repo.repoPath}
+        onRepoPath={repo.setRepoPath}
+        status={repo.status}
+        branches={repo.branches}
+        busy={commitFlow.busy}
+        branch={branchOps.branch}
+        branchInputRef={branchOps.branchInputRef}
+        onCheckout={branchOps.doCheckout}
+        onFetch={branchOps.doFetch}
+        onPull={branchOps.doPull}
+        onPush={branchOps.doPush}
+        onCreateBranch={branchOps.doCreateBranch}
       />
 
-      {error && <div className="ide-error">{error}</div>}
-      {info && <div className="ide-info">{info}</div>}
+      {repo.error && <div className="ide-error">{repo.error}</div>}
+      {repo.info && <div className="ide-info">{repo.info}</div>}
 
       <main className="ide-main">
         <div className="ide-tabs">
           <button
-            className={tab === "changes" ? "tab active" : "tab"}
-            onClick={() => setTab("changes")}
+            className={commitLog.tab === "changes" ? "tab active" : "tab"}
+            onClick={() => commitLog.setTab("changes")}
           >
             Changes
           </button>
           <button
-            className={tab === "log" ? "tab active" : "tab"}
+            className={commitLog.tab === "log" ? "tab active" : "tab"}
             onClick={() => {
-              setTab("log");
-              void loadLog();
+              commitLog.setTab("log");
+              void commitLog.loadLog();
             }}
             title="Reload history (F5)"
           >
@@ -841,107 +131,123 @@ function App() {
           </button>
         </div>
 
-        {tab === "changes" && (
+        {commitLog.tab === "changes" && (
           <div className="changes-pane">
             <div className="changes-body">
               <aside className="changes-tree">
               <FileList
                 title="Staged"
-                files={status?.staged ?? []}
-                selected={selectedFile}
-                onSelect={setSelectedFile}
+                files={repo.status?.staged ?? []}
+                selected={selection.selectedFile}
+                onSelect={selection.setSelectedFile}
                 bulkLabel={
-                  stagedChecked.length > 0
-                    ? `Unstage (${stagedChecked.length})`
+                  commitFlow.stagedChecked.length > 0
+                    ? `Unstage (${commitFlow.stagedChecked.length})`
                     : "Unstage all"
                 }
                 onBulk={() =>
-                  doUnstage(
-                    stagedChecked.length > 0 ? stagedChecked : stagedAll
+                  commitFlow.doUnstage(
+                    commitFlow.stagedChecked.length > 0
+                      ? commitFlow.stagedChecked
+                      : commitFlow.stagedAll
                   )
                 }
                 actionLabel="Unstage"
                 actionIcon="↑"
-                onAction={(p) => doUnstage([p])}
-                collapsed={collapsedDirs}
-                onToggleDir={toggleDir}
-                checked={checkedPaths}
-                onToggleFile={toggleFileChecked}
-                onSetDir={setDirChecked}
-                onClearChecked={clearChecked}
+                onAction={(p) => commitFlow.doUnstage([p])}
+                collapsed={treeUi.collapsedDirs}
+                onToggleDir={treeUi.toggleDir}
+                checked={repo.checkedPaths}
+                onToggleFile={repo.toggleFileChecked}
+                onSetDir={repo.setDirChecked}
+                onClearChecked={repo.clearChecked}
               />
               <FileList
                 title="Unstaged"
-                files={status?.unstaged ?? []}
-                selected={selectedFile}
-                onSelect={setSelectedFile}
+                files={repo.status?.unstaged ?? []}
+                selected={selection.selectedFile}
+                onSelect={selection.setSelectedFile}
                 bulkLabel={
-                  unstagedChecked.length > 0
-                    ? `Stage (${unstagedChecked.length})`
+                  commitFlow.unstagedChecked.length > 0
+                    ? `Stage (${commitFlow.unstagedChecked.length})`
                     : "Stage all"
                 }
                 onBulk={() =>
-                  doStage(
-                    unstagedChecked.length > 0 ? unstagedChecked : unstagedAll
+                  commitFlow.doStage(
+                    commitFlow.unstagedChecked.length > 0
+                      ? commitFlow.unstagedChecked
+                      : commitFlow.unstagedAll
                   )
                 }
                 actionLabel="Stage"
                 actionIcon="↓"
-                onAction={(p) => doStage([p])}
-                onDiscard={(p) => doDiscard([p])}
-                collapsed={collapsedDirs}
-                onToggleDir={toggleDir}
-                checked={checkedPaths}
-                onToggleFile={toggleFileChecked}
-                onSetDir={setDirChecked}
-                onClearChecked={clearChecked}
+                onAction={(p) => commitFlow.doStage([p])}
+                onDiscard={(p) => commitFlow.doDiscard([p])}
+                collapsed={treeUi.collapsedDirs}
+                onToggleDir={treeUi.toggleDir}
+                checked={repo.checkedPaths}
+                onToggleFile={repo.toggleFileChecked}
+                onSetDir={repo.setDirChecked}
+                onClearChecked={repo.clearChecked}
               />
             </aside>
 
             <div className="diff-area">
-              {selectedConflict ? (
+              {conflict.selectedConflict ? (
                 <ConflictEditor
-                  conflict={selectedConflict}
-                  repoPath={repoPath}
-                  onResolve={doResolve}
-                  onSaved={refresh}
-                  onError={setError}
+                  conflict={conflict.selectedConflict}
+                  repoPath={repo.repoPath}
+                  onResolve={conflict.doResolve}
+                  onSaved={repo.refresh}
+                  onError={repo.setError}
                 />
-              ) : selectedFile ? (
+              ) : selection.selectedFile ? (
                 <div className="file-diff">
                   <div className="diff-toolbar">
-                    <span className="diff-title">{selectedFile}</span>
-                    {fileView.isBinary ? (
+                    <span className="diff-title">{selection.selectedFile}</span>
+                    {fileDiff.fileView.isBinary ? (
                       <span className="muted">Binary file — editing disabled</span>
                     ) : (
                       <>
-                        {fileView.editing && (
-                          <button className="btn" onClick={saveEdit}>
+                        {fileDiff.fileView.editing && (
+                          <button className="btn" onClick={fileDiff.saveEdit}>
                             Save
                           </button>
                         )}
                         <button
                           className="btn"
-                          onClick={() => dispatchFileView({ type: "toggleEditing" })}
+                          onClick={() =>
+                            fileDiff.dispatchFileView({ type: "toggleEditing" })
+                          }
                         >
-                          {fileView.editing ? "Done editing" : "Edit"}
+                          {fileDiff.fileView.editing ? "Done editing" : "Edit"}
                         </button>
                       </>
                     )}
                   </div>
-                  {fileView.editing && !fileView.isBinary ? (
+                  {fileDiff.fileView.editing && !fileDiff.fileView.isBinary ? (
                     <textarea
                       className="edit-area"
-                      value={fileView.editText}
+                      value={fileDiff.fileView.editText}
                       onChange={(e) =>
-                        dispatchFileView({
+                        fileDiff.dispatchFileView({
                           type: "edit",
                           text: e.currentTarget.value,
                         })
                       }
                     />
                   ) : (
-                    <div className="diff-lines">{diffView ?? <span className="muted">Loading...</span>}</div>
+                    <div className="diff-lines">
+                      {fileDiff.diffView ?? <span className="muted">Loading...</span>}
+                    </div>
+                  )}
+                  {(hunkOps.views.unstaged || hunkOps.views.staged) && (
+                    <HunkPanel
+                      unstagedHunks={hunkOps.unstagedHunks}
+                      stagedHunks={hunkOps.stagedHunks}
+                      onStageHunk={hunkOps.doStageHunk}
+                      onUnstageHunk={hunkOps.doUnstageHunk}
+                    />
                   )}
                 </div>
               ) : (
@@ -951,96 +257,97 @@ function App() {
             </div>
 
             <CommitPanel
-              message={message}
-              onMessage={setMessage}
-              busy={busy}
-              canCommit={canCommit}
-              stagedCount={stagedCount}
-              unstagedCount={unstagedCount}
-              hasChanges={hasChanges}
-              onCommit={doCommit}
+              message={commitFlow.message}
+              onMessage={commitFlow.setMessage}
+              busy={commitFlow.busy}
+              canCommit={commitFlow.canCommit}
+              stagedCount={commitFlow.stagedCount}
+              unstagedCount={commitFlow.unstagedCount}
+              hasChanges={commitFlow.hasChanges}
+              onCommit={commitFlow.doCommit}
             />
           </div>
         )}
 
-        {tab === "log" && (
+        {commitLog.tab === "log" && (
           <LogPane
-            logs={logs}
-            hasMore={logHasMore}
-            onLoadMore={() => void loadMoreLog()}
-            selectedCommit={explorer.commit}
-            files={explorer.files}
-            selectedFile={explorer.file}
-            diffView={commitDiffView}
-            collapsed={logCollapsed}
-            onToggleDir={toggleLogDir}
-            onSelectCommit={selectCommit}
+            logs={commitLog.logs}
+            hasMore={commitLog.logHasMore}
+            onLoadMore={() => void commitLog.loadMoreLog()}
+            selectedCommit={commitLog.explorer.commit}
+            files={commitLog.explorer.files}
+            selectedFile={commitLog.explorer.file}
+            diffView={commitLog.commitDiffView}
+            collapsed={treeUi.logCollapsed}
+            onToggleDir={treeUi.toggleLogDir}
+            onSelectCommit={commitLog.selectCommit}
             onSelectFile={(p) => {
-              if (explorer.commit) void selectCommitFile(explorer.commit, p);
+              if (commitLog.explorer.commit)
+                void commitLog.selectCommitFile(commitLog.explorer.commit, p);
             }}
           />
         )}
       </main>
 
       <OpsPanel
-        ops={ops}
-        open={opsOpen}
-        onToggle={toggleOps}
-        onExport={exportOps}
-        onClear={() => setOps([])}
+        ops={opsPanel.ops}
+        open={opsPanel.opsOpen}
+        onToggle={opsPanel.toggleOps}
+        onExport={opsPanel.exportOps}
+        onClear={opsPanel.clearOps}
       />
 
       <StashTagBar
-        repoPath={repoPath}
-        busy={busy}
-        stashes={stashes}
-        tags={tags}
-        stashSel={stashSel}
-        onStashSel={setStashSel}
-        stashMsg={stashMsg}
-        onStashMsg={setStashMsg}
-        tagInput={tagInput}
-        onTagInput={setTagInput}
-        tagMsg={tagMsg}
-        onTagMsg={setTagMsg}
-        tagSel={tagSel}
-        onTagSel={setTagSel}
-        onSaveStash={doStashSave}
-        onApplyStash={doStashApply}
-        onPopStash={doStashPop}
-        onDropStash={doStashDrop}
-        onCreateTag={doCreateTag}
-        onDeleteTag={doDeleteTag}
+        repoPath={repo.repoPath}
+        busy={commitFlow.busy}
+        stashes={repo.stashes}
+        tags={repo.tags}
+        stashSel={repo.stashSel}
+        onStashSel={repo.setStashSel}
+        stashMsg={stashTags.stashMsg}
+        onStashMsg={stashTags.setStashMsg}
+        tagInput={stashTags.tagInput}
+        onTagInput={stashTags.setTagInput}
+        tagMsg={stashTags.tagMsg}
+        onTagMsg={stashTags.setTagMsg}
+        tagSel={repo.tagSel}
+        onTagSel={repo.setTagSel}
+        onSaveStash={stashTags.doStashSave}
+        onApplyStash={stashTags.doStashApply}
+        onPopStash={stashTags.doStashPop}
+        onDropStash={stashTags.doStashDrop}
+        onCreateTag={stashTags.doCreateTag}
+        onDeleteTag={stashTags.doDeleteTag}
         onRefresh={() => {
-          if (!busy) void refresh();
+          if (!commitFlow.busy) void repo.refresh();
         }}
       />
 
       <BranchActions
-        repoPath={repoPath}
-        busy={busy}
-        conflictsCount={conflicts.length}
-        branch={branch}
-        onBranch={setBranch}
-        branchInputRef={branchInputRef}
-        mergeTarget={mergeTarget}
-        onMergeTarget={setMergeTarget}
-        mergeCandidates={mergeCandidates}
-        branchCount={branches.length}
-        currentBranchName={currentBranchName}
-        remote={remote}
-        onRemote={setRemote}
-        onMerge={doMerge}
-        onAbortMerge={doAbortMerge}
-        onCreateBranch={doCreateBranch}
-        rebaseTarget={rebaseTarget}
-        onRebaseTarget={setRebaseTarget}
-        rebaseInProgress={rebaseInProgress}
-        onRebase={doRebase}
-        onRebaseContinue={doRebaseContinue}
-        onRebaseAbort={doRebaseAbort}
+        repoPath={repo.repoPath}
+        busy={commitFlow.busy}
+        conflictsCount={repo.conflicts.length}
+        branch={branchOps.branch}
+        onBranch={branchOps.setBranch}
+        branchInputRef={branchOps.branchInputRef}
+        mergeTarget={branchOps.mergeTarget}
+        onMergeTarget={branchOps.setMergeTarget}
+        mergeCandidates={branchOps.mergeCandidates}
+        branchCount={repo.branches.length}
+        currentBranchName={branchOps.currentBranchName}
+        remote={branchOps.remote}
+        onRemote={branchOps.setRemote}
+        onMerge={branchOps.doMerge}
+        onAbortMerge={branchOps.doAbortMerge}
+        onCreateBranch={branchOps.doCreateBranch}
+        rebaseTarget={branchOps.rebaseTarget}
+        onRebaseTarget={branchOps.setRebaseTarget}
+        rebaseInProgress={repo.rebaseInProgress}
+        onRebase={branchOps.doRebase}
+        onRebaseContinue={branchOps.doRebaseContinue}
+        onRebaseAbort={branchOps.doRebaseAbort}
         onRefresh={() => {
-          if (!busy) void refresh();
+          if (!commitFlow.busy) void repo.refresh();
         }}
       />
     </div>

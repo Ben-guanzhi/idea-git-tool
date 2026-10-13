@@ -1164,3 +1164,39 @@ button {
     color: #888;
   }
 }
+
+/* Hunk-level staging panel (task ②): reuses the diff row and group header
+   classes above; these rules only size/lay out the panel itself. */
+.hunk-panel {
+  flex-shrink: 0;
+  max-height: 40%;
+  overflow: auto;
+  border-top: 1px solid #ddd;
+  background: #f7f8fa;
+}
+
+.hunk-group {
+  display: flex;
+  flex-direction: column;
+}
+
+.hunk-item {
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid #e0e0e0;
+}
+
+.hunk-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+}
+
+.hunk-lines {
+  flex: none;
+  max-height: 160px;
+  overflow: auto;
+  border-top: 1px solid #eee;
+  background: #fff;
+}

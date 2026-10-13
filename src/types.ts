@@ -49,6 +49,13 @@ export interface FileDiff {
   rows: DiffRow[];
 }
 
+export interface StagingHunk {
+  oldStart: number;
+  newStart: number;
+  oldLines: string[];
+  newLines: string[];
+}
+
 export interface CommitSummary {
   id: string;
   shortId: string;
