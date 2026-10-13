@@ -13,6 +13,7 @@ static COUNTING: alloc_count::Counting = alloc_count::Counting;
 
 mod branch;
 mod diff;
+mod hunks;
 mod log;
 mod merge;
 mod rebase;
@@ -49,6 +50,9 @@ pub fn run() {
             remote::pull,
             working::discard,
             working::write_file,
+            hunks::get_hunks,
+            hunks::stage_hunks,
+            hunks::unstage_hunks,
             stash::list_stashes,
             stash::stash_save,
             stash::stash_apply,
