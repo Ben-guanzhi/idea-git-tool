@@ -18,8 +18,8 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm exec tsc --noEmit
-      - run: pnpm test
+      - run: sh "$GITHUB_WORKSPACE/.github/scripts/gate.sh" pnpm exec tsc --noEmit
+      - run: sh "$GITHUB_WORKSPACE/.github/scripts/gate.sh" pnpm test
 
   backend:
     runs-on: ubuntu-latest
@@ -33,4 +33,18 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
-      - run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      # tauri-build validates `frontendDist` ("../dist") at build time, and the
+      # frontend job above runs on a different runner whose dist/ is also
+      # gitignored, so this job has to produce it itself.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+
+      - run: sh "$GITHUB_WORKSPACE/.github/scripts/gate.sh" cargo test --manifest-path src-tauri/Cargo.toml
