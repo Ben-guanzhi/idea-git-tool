@@ -84,6 +84,14 @@ fn canonicalize_existing(path: &Path) -> Result<PathBuf, std::io::Error> {
 
 /// Reject absolute paths, drive prefixes and `..`/root components outright.
 pub(crate) fn validate_rel_path(path: &str) -> Result<(), String> {
+    // A backslash is only a separator on Windows, so on Unix `Path` cannot see
+    // `C:\Windows\...` or `..\x` as absolute or traversal at all: every
+    // backslash-containing string is a single valid filename. Git treats the
+    // two separators as equivalent, so a Windows user-supplied path could
+    // escape the workdir. Reject backslashes to close the same hole on both.
+    if path.contains('\\') {
+        return Err(format!("非法路径「{path}」：不能包含反斜杠"));
+    }
     let p = Path::new(path);
     if p.is_absolute()
         || p.components().any(|c| {

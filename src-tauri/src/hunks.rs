@@ -13,9 +13,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use crate::repo::{
-    bytes_are_binary, open_repo, resolve_in_workdir, validate_rel_path,
-};
+use crate::repo::{bytes_are_binary, open_repo, resolve_in_workdir, validate_rel_path};
 
 /// One contiguous delete+insert region of a line diff, without context
 /// lines (the MVP groups only the changed runs; the frontend renders
@@ -89,10 +87,7 @@ pub(crate) fn join_lines(lines: &[String]) -> String {
 /// maximal run of deletes and inserts (a match separates runs — no
 /// merging across any context) becomes one [`StagingHunk`]. Pure deletes
 /// get an empty `new_lines`, pure inserts an empty `old_lines`.
-pub(crate) fn diff_to_hunks(
-    old: &[String],
-    new: &[String],
-) -> Result<Vec<StagingHunk>, String> {
+pub(crate) fn diff_to_hunks(old: &[String], new: &[String]) -> Result<Vec<StagingHunk>, String> {
     // Trim the common prefix/suffix first so the O(n·m) DP below only
     // covers the region that actually differs (same trick as diff.rs).
     let mut start = 0usize;
@@ -252,10 +247,7 @@ fn blob_lines(repo: &git2::Repository, id: git2::Oid) -> Result<Vec<String>, Str
 /// no such file. (`git2::TreeEntry` borrows its tree, so the command shells
 /// only keep the two scalars they need out of it.)
 fn head_entry_info(repo: &git2::Repository, path: &str) -> Option<(git2::Oid, u32)> {
-    let commit = repo
-        .head()
-        .ok()
-        .and_then(|h| h.peel_to_commit().ok());
+    let commit = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
     let tree = commit.as_ref().and_then(|c| c.tree().ok())?;
     let entry = tree.get_path(Path::new(path)).ok()?;
     Some((entry.id(), entry.filemode() as u32))
@@ -282,7 +274,9 @@ fn write_index_content(
         // The un-applied result is "file gone": drop the entry (a staged
         // deletion) rather than leaving an empty-blob entry behind.
         if index.get_path(Path::new(path), 0).is_some() {
-            index.remove_path(Path::new(path)).map_err(|e| e.to_string())?;
+            index
+                .remove_path(Path::new(path))
+                .map_err(|e| e.to_string())?;
         }
         return index.write().map_err(|e| e.to_string());
     }
@@ -374,7 +368,9 @@ fn stage_hunks_impl(
         .unwrap_or(DEFAULT_MODE);
     // Full staging of a deletion (workdir file gone, every line removed)
     // is a staged delete: drop the entry, like `git add` would.
-    let wt_missing = resolve_in_workdir(&repo, &path).map(|p| !p.exists()).unwrap_or(false);
+    let wt_missing = resolve_in_workdir(&repo, &path)
+        .map(|p| !p.exists())
+        .unwrap_or(false);
     write_index_content(&mut index, &path, &text, mode, wt_missing)
 }
 
@@ -726,7 +722,9 @@ mod tests {
             hunks
         );
         // And nothing is left unstaged.
-        assert!(get_hunks_impl(r.path_str(), "f.txt".into(), false).unwrap().is_empty());
+        assert!(get_hunks_impl(r.path_str(), "f.txt".into(), false)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -766,7 +764,11 @@ mod tests {
             .iter()
             .find(|s| s.path() == Some("f.txt"))
             .expect("f.txt in status");
-        assert!(entry.status().is_wt_modified(), "status = {:?}", entry.status());
+        assert!(
+            entry.status().is_wt_modified(),
+            "status = {:?}",
+            entry.status()
+        );
     }
 
     #[test]
@@ -790,7 +792,10 @@ mod tests {
             "1\nTWO\n3\n4\n5\n6\n7\nEIGHT\n9\n10\n"
         );
         // Both hunks are unstaged again.
-        assert_eq!(get_hunks_impl(r.path_str(), "f.txt".into(), false).unwrap(), hunks);
+        assert_eq!(
+            get_hunks_impl(r.path_str(), "f.txt".into(), false).unwrap(),
+            hunks
+        );
     }
 
     #[test]
@@ -872,7 +877,9 @@ mod tests {
         let err = get_hunks_impl(r.path_str(), "new.txt".into(), false).unwrap_err();
         assert_eq!(err, UNTRACKED_ERR);
         // With nothing on either side, the staged view is simply empty.
-        assert!(get_hunks_impl(r.path_str(), "new.txt".into(), true).unwrap().is_empty());
+        assert!(get_hunks_impl(r.path_str(), "new.txt".into(), true)
+            .unwrap()
+            .is_empty());
 
         // A binary tracked file must not be hunk-staged (lossy text would
         // corrupt the bytes).

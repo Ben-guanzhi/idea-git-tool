@@ -196,12 +196,7 @@ fn lcs_char_spans(
 /// a byte- or char-indexed range would misalign as soon as the line contains
 /// non-BMP or multi-byte characters. Comparing per char (not per byte) also
 /// guarantees a span never splits inside a multi-byte character.
-fn char_diff_range(
-    line: &str,
-    other: &str,
-    sc: &mut Scratch,
-    out: &mut Vec<(usize, usize)>,
-) {
+fn char_diff_range(line: &str, other: &str, sc: &mut Scratch, out: &mut Vec<(usize, usize)>) {
     let Scratch {
         line_chars: a,
         other_chars: b,
@@ -220,9 +215,7 @@ fn char_diff_range(
     b.extend(other.chars());
 
     let mut common_prefix = 0usize;
-    while common_prefix < a.len()
-        && common_prefix < b.len()
-        && a[common_prefix] == b[common_prefix]
+    while common_prefix < a.len() && common_prefix < b.len() && a[common_prefix] == b[common_prefix]
     {
         common_prefix += 1;
     }
@@ -248,17 +241,7 @@ fn char_diff_range(
     if at.len().saturating_mul(bt.len()) > MAX_HIGHLIGHT_DP_CELLS {
         out.push((common_prefix, line_end));
     } else {
-        lcs_char_spans(
-            a_mid,
-            at,
-            b_mid,
-            bt,
-            dir,
-            prev,
-            cur,
-            flagged,
-            out,
-        );
+        lcs_char_spans(a_mid, at, b_mid, bt, dir, prev, cur, flagged, out);
         for span in out.iter_mut() {
             span.0 += common_prefix;
             span.1 += common_prefix;
@@ -321,7 +304,10 @@ fn window_ops<'a>(ops: Vec<Line<'a>>) -> Vec<Op<'a>> {
     if !segs.iter().any(|(is_context, _, _)| !*is_context) {
         // No change to window on: every line is shown, none was edited, so
         // borrowing the text would be the same as this copy.
-        return ops.into_iter().map(|(k, t)| (k, Cow::Borrowed(t))).collect();
+        return ops
+            .into_iter()
+            .map(|(k, t)| (k, Cow::Borrowed(t)))
+            .collect();
     }
 
     let mut out: Vec<Op<'a>> = Vec::new();
@@ -370,7 +356,7 @@ fn align_rows(ops: &[Op<'_>]) -> Vec<DiffRow> {
     /// copies — [`align_rows`] copies once, when it builds the segment.
     fn text<'a, 'b>(op: &'b Op<'a>) -> &'b str {
         match &op.1 {
-            Cow::Borrowed(s) => *s,
+            Cow::Borrowed(s) => s,
             Cow::Owned(s) => s.as_str(),
         }
     }
@@ -658,8 +644,8 @@ pub(crate) async fn get_commit_file_diff(
 #[cfg(test)]
 mod tests {
     use super::{
-        align_rows, char_diff_range, diff_rows, elided_text, lcs_matrix, window_ops, DiffRow,
-        Scratch, DIFF_CONTEXT, ELIDED, MAX_HIGHLIGHT_DP_CELLS, Op,
+        align_rows, char_diff_range, diff_rows, elided_text, lcs_matrix, window_ops, DiffRow, Op,
+        Scratch, DIFF_CONTEXT, ELIDED, MAX_HIGHLIGHT_DP_CELLS,
     };
     use std::borrow::Cow;
 
@@ -1011,7 +997,10 @@ mod tests {
         );
         let modified = rows.iter().find(|r| r.kind == "modified").unwrap();
         assert_eq!(modified.left.as_ref().unwrap().text, "line-1000");
-        assert_eq!(modified.right.as_ref().unwrap().text, "the only changed line");
+        assert_eq!(
+            modified.right.as_ref().unwrap().text,
+            "the only changed line"
+        );
     }
 
     // ── diff：行内高亮区间按 UTF-16 码元计（前端 String.slice 的单位）──
@@ -1456,7 +1445,10 @@ mod tests {
                 "foo = 99; bar = 2; baz = 42;".into(),
             ),
             ("a\n¦b\nc".into(), "a\nX\nc".into()),
-            ("a\nb\n1\n2\n3\n4\n5\n6\n7\n8\n9\nc".into(), "a\nb\n1\n2\n3\nX\n5\n6\n7\n8\n9\nc".into()),
+            (
+                "a\nb\n1\n2\n3\n4\n5\n6\n7\n8\n9\nc".into(),
+                "a\nb\n1\n2\n3\nX\n5\n6\n7\n8\n9\nc".into(),
+            ),
             // Coarse-span fallback: the trimmed middle exceeds the token budget.
             (long_tokens(0), long_tokens(600)),
         ];
