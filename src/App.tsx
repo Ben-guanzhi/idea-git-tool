@@ -4,15 +4,12 @@
 // refresh / repo-persist (useRepoStatus), info/error dismiss (useRepoStatus),
 // keyboard shortcuts (useCommitFlow), file-diff load (useSelectedFileDiff).
 
-import { ConflictEditor } from "./ConflictEditor";
-import { FileList } from "./FileTree";
-import { HunkPanel } from "./HunkPanel";
+import { ChangesTab } from "./ChangesTab";
 import { LogPane } from "./LogPane";
 import { OpsPanel } from "./OpsPanel";
 import { TopBar } from "./TopBar";
 import { BranchActions } from "./BranchActions";
 import { StashTagBar } from "./StashTagBar";
-import { CommitPanel } from "./CommitPanel";
 import { useBranchOps } from "./hooks/useBranchOps";
 import { useCommitFlow } from "./hooks/useCommitFlow";
 import { useCommitLog } from "./hooks/useCommitLog";
@@ -132,141 +129,45 @@ function App() {
         </div>
 
         {commitLog.tab === "changes" && (
-          <div className="changes-pane">
-            <div className="changes-body">
-              <aside className="changes-tree">
-              <FileList
-                title="Staged"
-                files={repo.status?.staged ?? []}
-                selected={selection.selectedFile}
-                onSelect={selection.setSelectedFile}
-                bulkLabel={
-                  commitFlow.stagedChecked.length > 0
-                    ? `Unstage (${commitFlow.stagedChecked.length})`
-                    : "Unstage all"
-                }
-                onBulk={() =>
-                  commitFlow.doUnstage(
-                    commitFlow.stagedChecked.length > 0
-                      ? commitFlow.stagedChecked
-                      : commitFlow.stagedAll
-                  )
-                }
-                actionLabel="Unstage"
-                actionIcon="↑"
-                onAction={(p) => commitFlow.doUnstage([p])}
-                collapsed={treeUi.collapsedDirs}
-                onToggleDir={treeUi.toggleDir}
-                checked={repo.checkedPaths}
-                onToggleFile={repo.toggleFileChecked}
-                onSetDir={repo.setDirChecked}
-                onClearChecked={repo.clearChecked}
-              />
-              <FileList
-                title="Unstaged"
-                files={repo.status?.unstaged ?? []}
-                selected={selection.selectedFile}
-                onSelect={selection.setSelectedFile}
-                bulkLabel={
-                  commitFlow.unstagedChecked.length > 0
-                    ? `Stage (${commitFlow.unstagedChecked.length})`
-                    : "Stage all"
-                }
-                onBulk={() =>
-                  commitFlow.doStage(
-                    commitFlow.unstagedChecked.length > 0
-                      ? commitFlow.unstagedChecked
-                      : commitFlow.unstagedAll
-                  )
-                }
-                actionLabel="Stage"
-                actionIcon="↓"
-                onAction={(p) => commitFlow.doStage([p])}
-                onDiscard={(p) => commitFlow.doDiscard([p])}
-                collapsed={treeUi.collapsedDirs}
-                onToggleDir={treeUi.toggleDir}
-                checked={repo.checkedPaths}
-                onToggleFile={repo.toggleFileChecked}
-                onSetDir={repo.setDirChecked}
-                onClearChecked={repo.clearChecked}
-              />
-            </aside>
-
-            <div className="diff-area">
-              {conflict.selectedConflict ? (
-                <ConflictEditor
-                  conflict={conflict.selectedConflict}
-                  repoPath={repo.repoPath}
-                  onResolve={conflict.doResolve}
-                  onSaved={repo.refresh}
-                  onError={repo.setError}
-                />
-              ) : selection.selectedFile ? (
-                <div className="file-diff">
-                  <div className="diff-toolbar">
-                    <span className="diff-title">{selection.selectedFile}</span>
-                    {fileDiff.fileView.isBinary ? (
-                      <span className="muted">Binary file — editing disabled</span>
-                    ) : (
-                      <>
-                        {fileDiff.fileView.editing && (
-                          <button className="btn" onClick={fileDiff.saveEdit}>
-                            Save
-                          </button>
-                        )}
-                        <button
-                          className="btn"
-                          onClick={() =>
-                            fileDiff.dispatchFileView({ type: "toggleEditing" })
-                          }
-                        >
-                          {fileDiff.fileView.editing ? "Done editing" : "Edit"}
-                        </button>
-                      </>
-                    )}
-                  </div>
-                  {fileDiff.fileView.editing && !fileDiff.fileView.isBinary ? (
-                    <textarea
-                      className="edit-area"
-                      value={fileDiff.fileView.editText}
-                      onChange={(e) =>
-                        fileDiff.dispatchFileView({
-                          type: "edit",
-                          text: e.currentTarget.value,
-                        })
-                      }
-                    />
-                  ) : (
-                    <div className="diff-lines">
-                      {fileDiff.diffView ?? <span className="muted">Loading...</span>}
-                    </div>
-                  )}
-                  {(hunkOps.views.unstaged || hunkOps.views.staged) && (
-                    <HunkPanel
-                      unstagedHunks={hunkOps.unstagedHunks}
-                      stagedHunks={hunkOps.stagedHunks}
-                      onStageHunk={hunkOps.doStageHunk}
-                      onUnstageHunk={hunkOps.doUnstageHunk}
-                    />
-                  )}
-                </div>
-              ) : (
-                <div className="empty-pane">Select a file to view its diff.</div>
-              )}
-            </div>
-            </div>
-
-            <CommitPanel
-              message={commitFlow.message}
-              onMessage={commitFlow.setMessage}
-              busy={commitFlow.busy}
-              canCommit={commitFlow.canCommit}
-              stagedCount={commitFlow.stagedCount}
-              unstagedCount={commitFlow.unstagedCount}
-              hasChanges={commitFlow.hasChanges}
-              onCommit={commitFlow.doCommit}
-            />
-          </div>
+          <ChangesTab
+            status={repo.status}
+            selectedFile={selection.selectedFile}
+            setSelectedFile={selection.setSelectedFile}
+            checkedPaths={repo.checkedPaths}
+            toggleFileChecked={repo.toggleFileChecked}
+            setDirChecked={repo.setDirChecked}
+            clearChecked={repo.clearChecked}
+            collapsedDirs={treeUi.collapsedDirs}
+            toggleDir={treeUi.toggleDir}
+            stagedChecked={commitFlow.stagedChecked}
+            stagedAll={commitFlow.stagedAll}
+            unstagedChecked={commitFlow.unstagedChecked}
+            unstagedAll={commitFlow.unstagedAll}
+            doStage={commitFlow.doStage}
+            doUnstage={commitFlow.doUnstage}
+            doDiscard={commitFlow.doDiscard}
+            message={commitFlow.message}
+            setMessage={commitFlow.setMessage}
+            busy={commitFlow.busy}
+            canCommit={commitFlow.canCommit}
+            stagedCount={commitFlow.stagedCount}
+            unstagedCount={commitFlow.unstagedCount}
+            hasChanges={commitFlow.hasChanges}
+            doCommit={commitFlow.doCommit}
+            selectedConflict={conflict.selectedConflict}
+            doResolve={conflict.doResolve}
+            repoPath={repo.repoPath}
+            fileView={fileDiff.fileView}
+            diffView={fileDiff.diffView}
+            dispatchFileView={fileDiff.dispatchFileView}
+            saveEdit={fileDiff.saveEdit}
+            unstagedHunks={hunkOps.unstagedHunks}
+            stagedHunks={hunkOps.stagedHunks}
+            doStageHunk={hunkOps.doStageHunk}
+            doUnstageHunk={hunkOps.doUnstageHunk}
+            refresh={repo.refresh}
+            setError={repo.setError}
+          />
         )}
 
         {commitLog.tab === "log" && (

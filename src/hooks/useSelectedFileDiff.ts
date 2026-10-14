@@ -37,16 +37,16 @@ export function useSelectedFileDiff(params: {
     let cancelled = false;
     (async () => {
       try {
-        // 保留已知缺陷（原 App.tsx:280-312）：串行双加载——get_file_contents 与
-        // get_diff 逐个 await，两段网络往返串行叠加。
-        const fc = await invoke<FileContent>("get_file_contents", {
-          repoPath,
-          path: selectedFile,
-        });
-        const d = await invoke<FileDiff>("get_diff", {
-          repoPath,
-          path: selectedFile,
-        });
+        const [fc, d] = await Promise.all([
+          invoke<FileContent>("get_file_contents", {
+            repoPath,
+            path: selectedFile,
+          }),
+          invoke<FileDiff>("get_diff", {
+            repoPath,
+            path: selectedFile,
+          }),
+        ]);
         if (!cancelled) {
           dispatchFileView({
             type: "loaded",
@@ -95,8 +95,7 @@ export function useSelectedFileDiff(params: {
         content: fileView.editText,
       });
       setInfo("File saved");
-      // 保留已知缺陷（原 App.tsx:~297 关联，saveEdit 376-390）：保存后只 refresh()
-      // 状态快照，不重新拉取文件内容与 diff（加载 effect 仅依赖 [selectedFile, repoPath]）。
+      await loadFileView(selectedFile);
       await refresh();
     } catch (e) {
       setError(String(e));

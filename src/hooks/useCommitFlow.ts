@@ -214,15 +214,19 @@ export function useCommitFlow(params: {
       detail: subject,
       onSuccess: () => setMessage(""),
       fn: async () => {
-        // Nothing staged yet: stage all unstaged changes first (Stage & Commit).
-        // 保留已知缺陷（原 App.tsx:530-540）：自动 stage 与 commit 非原子——stage 成功后
-        // commit 失败会留下已暂存的状态，两步之间可能被外部改动插入。
         if (stagedCount === 0 && unstagedCount > 0) {
-          await invoke("stage", {
-            repoPath,
-            paths: (status?.unstaged ?? []).map((f) => f.path),
-          });
+          const paths = (status?.unstaged ?? []).map((f) => f.path);
+          await invoke("stage", { repoPath, paths });
           logOp("stage", "ok", `auto (stage & commit): ${unstagedCount} file(s)`);
+          try {
+            const r = await invoke<string>("commit", {
+              args: { repoPath, message, authorName: "", authorEmail: "" },
+            });
+            return `Committed ${r.slice(0, 12)} — ${subject}`;
+          } catch (e) {
+            await invoke("unstage", { repoPath, paths }).catch(() => {});
+            throw e;
+          }
         }
         const r = await invoke<string>("commit", {
           args: { repoPath, message, authorName: "", authorEmail: "" },

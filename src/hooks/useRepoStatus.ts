@@ -94,14 +94,6 @@ export function useRepoStatus() {
       setStashes(st);
       setTags(tg);
       setRebaseInProgress(rip);
-      // The new snapshots may have invalidated the current selections
-      // (stash dropped, tag deleted by someone else): prune like checkedPaths.
-      // 保留已知缺陷（原 App.tsx:222-224）：stale-seq 竞态吞结果——seq 检查不通过时
-      // 整次快照（含这里的 stash/tag 剪枝）被静默丢弃，不做任何补偿。
-      setStashSel((prev) =>
-        prev !== null && !st.some((x) => x.index === prev) ? null : prev
-      );
-      setTagSel((prev) => (prev && !tg.some((t) => t.name === prev) ? "" : prev));
     } catch (e) {
       // A newer refresh may have started while this one was in flight; a stale
       // failure must not clobber the error of a fresher view (mirror of the
@@ -114,6 +106,13 @@ export function useRepoStatus() {
   useEffect(() => {
     if (repoPath.trim()) refresh();
   }, [repoPath, refresh]);
+
+  useEffect(() => {
+    setStashSel((prev) =>
+      prev !== null && !stashes.some((x) => x.index === prev) ? null : prev
+    );
+    setTagSel((prev) => (prev && !tags.some((t) => t.name === prev) ? "" : prev));
+  }, [stashes, tags]);
 
   useEffect(() => {
     if (!repoPath.trim()) return;
